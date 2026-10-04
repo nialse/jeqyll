@@ -1,10 +1,11 @@
-Unicode 16.0.0 property and case-fold data
+Unicode 16.0.0 property, case-fold and grapheme-break data
 
 The numeric ranges, property aliases and case-fold mappings in
 src/regex_unicode_data.ll are data-only transcriptions of
-vendor/oniguruma/src/unicode_property_data.c and unicode_fold_data.c in the
-jq source pinned by PATHS.md. No lookup or matching implementation from
-those files is included.
+vendor/oniguruma/src/unicode_property_data.c, unicode_fold_data.c and
+unicode_egcb_data.c at jq commit
+579e6f76cffd7643ba4002a2c3618a5ea710589a. No lookup or matching
+implementation from those files is included.
 
 Copyright (c) 2016-2024 K.Kosako (property data)
 Copyright (c) 2017-2024 K.Kosako (case-fold data)
