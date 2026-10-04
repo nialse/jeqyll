@@ -1,0 +1,7 @@
+/build/
+/build-*/
+/jeqy
+/jeqy.next
+/.work/
+__pycache__/
+*.pyc
