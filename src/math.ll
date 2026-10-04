@@ -25,11 +25,18 @@ declare double @m_scale_bits(double, i64)
 declare double @m_fmod_bits(double, double)
 declare double @m_remainder_bits(double, double)
 declare double @m_atan2_bits(double, double)
+declare double @m_precise_trig(double, i32)
+declare double @m_precise_atan(double)
+declare double @m_precise_asin(double, i1)
+declare double @m_precise_log(double, i1)
+declare double @m_precise_log1p(double)
+declare double @m_precise_inverse_hyperbolic(double, i1)
 declare double @m_hypot_bits(double, double)
 declare double @m_fma(double, double, double)
 declare double @m_expm1(double)
 declare double @m_log1p(double)
 declare double @m_pow(double, double)
+declare double @m_precise_pow(double, double)
 declare double @m_erf(double, i1)
 declare double @m_lgamma(double, ptr)
 declare double @m_gamma(double)
@@ -275,21 +282,19 @@ done:
   %result = select i1 %invert, double %directinverse, double %acc
   ret double %result
 fractional:
-  %lx = call double @m_log(double %x)
-  %exponent = fmul double %lx, %y
-  %value = call double @m_exp(double %exponent)
+  %value = call double @m_precise_pow(double %x, double %y)
   ret double %value
 }
 
 define double @m_sin(double %x) {
 entry:
-  %result = call double @m_trig(double %x, i1 false)
+  %result = call double @m_precise_trig(double %x, i32 0)
   ret double %result
 }
 
 define double @m_cos(double %x) {
 entry:
-  %result = call double @m_trig(double %x, i1 true)
+  %result = call double @m_precise_trig(double %x, i32 1)
   ret double %result
 }
 
@@ -391,8 +396,7 @@ log:
   %logx = call double @m_log(double %x)
   ret double %logx
 log2:
-  %log2l = call double @m_log(double %x)
-  %log2x = fdiv double %log2l, 6.9314718055994529e-01
+  %log2x = call double @m_precise_log(double %x, i1 true)
   ret double %log2x
 log10:
   %log10l = call double @m_log(double %x)
@@ -405,23 +409,16 @@ cos:
   %cosx = call double @m_cos(double %x)
   ret double %cosx
 tan:
-  %tans = call double @m_sin(double %x)
-  %tanc = call double @m_cos(double %x)
-  %tanx = fdiv double %tans, %tanc
+  %tanx = call double @m_precise_trig(double %x, i32 2)
   ret double %tanx
 atan:
-  %atanx = call double @m_atan(double %x)
+  %atanx = call double @m_precise_atan(double %x)
   ret double %atanx
 asin:
-  %asinxx = fmul double %x, %x
-  %asind = fsub double 1.000000e+00, %asinxx
-  %asins = call double @llvm.sqrt.f64(double %asind)
-  %asinr = fdiv double %x, %asins
-  %asinx = call double @m_atan(double %asinr)
+  %asinx = call double @m_precise_asin(double %x, i1 false)
   ret double %asinx
 acos:
-  %acosasin = call double @m_unary(i32 20, double %x)
-  %acosx = fsub double 1.5707963267948966e+00, %acosasin
+  %acosx = call double @m_precise_asin(double %x, i1 true)
   ret double %acosx
 sinh:
   %sinhx = call double @m_hyperbolic(i32 24, double %x)
@@ -431,20 +428,34 @@ cosh:
   ret double %coshx
 tanh:
   %tanha = call double @llvm.fabs.f64(double %x)
+  %tanhlarge = fcmp oge double %tanha, 1.0
+  br i1 %tanhlarge, label %tanhstable, label %tanhsmall
+tanhstable:
+  %tanhtwice = fmul double %tanha, 2.0
+  %tanhexp = call double @m_expm1(double %tanhtwice)
+  %tanhplus = fadd double %tanhexp, 2.0
+  %tanhcorrection = fdiv double 2.0, %tanhplus
+  %tanhstablevalue = fsub double 1.0, %tanhcorrection
+  br label %tanhsign
+tanhsmall:
   %tanhn = fmul double %tanha, -2.000000e+00
   %tanhnum = call double @m_expm1(double %tanhn)
   %tanhden = fadd double %tanhnum, 2.000000e+00
-  %tanhnegative = fdiv double %tanhnum, %tanhden
-  %tanhpositive = fneg double %tanhnegative
+  %tanhsmallnegative = fdiv double %tanhnum, %tanhden
+  %tanhsmallpositive = fneg double %tanhsmallnegative
+  br label %tanhsign
+tanhsign:
+  %tanhpositive = phi double [%tanhstablevalue, %tanhstable], [%tanhsmallpositive, %tanhsmall]
+  %tanhnegative = fneg double %tanhpositive
   %tanhbits = bitcast double %x to i64
   %tanhneg = icmp slt i64 %tanhbits, 0
   %tanhx = select i1 %tanhneg, double %tanhnegative, double %tanhpositive
   ret double %tanhx
 asinh:
-  %asinhx = call double @m_hyperbolic(i32 27, double %x)
+  %asinhx = call double @m_precise_inverse_hyperbolic(double %x, i1 false)
   ret double %asinhx
 acosh:
-  %acoshx = call double @m_hyperbolic(i32 28, double %x)
+  %acoshx = call double @m_precise_inverse_hyperbolic(double %x, i1 true)
   ret double %acoshx
 atanh:
   %atanhx = call double @m_hyperbolic(i32 29, double %x)
@@ -466,7 +477,7 @@ expm1:
   %expm1x = call double @m_expm1(double %x)
   ret double %expm1x
 log1p:
-  %log1px = call double @m_log1p(double %x)
+  %log1px = call double @m_precise_log1p(double %x)
   ret double %log1px
 logb:
   %raw = bitcast double %x to i64

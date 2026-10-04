@@ -2,9 +2,8 @@
 %RC = type { ptr, ptr, ptr, i64, i32, i32, ptr, i64, i64, i64, ptr, ptr, ptr, ptr, i64 }
 
 declare i32 @rx_unicode_expand(i32, ptr)
-declare i64 @rx_run(ptr, ptr, i64, ptr, i64)
 
-define i64 @rx_literal_fold(ptr %node, ptr %ctx, i64 %pos, ptr %captures, i64 %depth) {
+define {ptr, i64} @rx_literal_fold(ptr %node, ptr %ctx, i64 %pos) {
 entry:
   %left = alloca [3 x i32]
   %right = alloca [3 x i32]
@@ -76,10 +75,11 @@ continue:
   %tailp = getelementptr %RX, ptr %current, i32 0, i32 4
   %tail = load ptr, ptr %tailp
   %end = add i64 %position, 1
-  %result = call i64 @rx_run(ptr %tail, ptr %ctx, i64 %end, ptr %captures, i64 %depth)
-  ret i64 %result
+  %pair = insertvalue {ptr, i64} poison, ptr %tail, 0
+  %result = insertvalue {ptr, i64} %pair, i64 %end, 1
+  ret {ptr, i64} %result
 fail:
-  ret i64 -1
+  ret {ptr, i64} {ptr null, i64 -1}
 }
 
 define i64 @rx_backref_fold(ptr %ctx, i64 %start, i64 %end, i64 %pos) {

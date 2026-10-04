@@ -1,6 +1,6 @@
 %V = type { i32, i32, double, i64, i64, ptr, ptr }
 %N = type { i32, i32, ptr, ptr, ptr, ptr, ptr, i64, i64 }
-%P = type { ptr, i64, i64, i32, ptr, i32, i64, i64 }
+%P = type { ptr, i64, i64, i32, ptr, i32, i64, i64, ptr }
 %E = type { ptr, ptr, ptr, i32, ptr, ptr }
 
 @j_error = external global ptr
@@ -90,6 +90,9 @@ declare ptr @j_lex_number(ptr, i64, ptr)
 declare ptr @j_dump(ptr, i32)
 declare ptr @j_binary(i32, ptr, ptr)
 declare ptr @j_negate(ptr)
+declare void @j_object_key_error(ptr)
+declare void @j_iteration_error(ptr)
+declare void @j_syntax_diagnostics(ptr, i64)
 declare void @j_fail(ptr)
 declare ptr @j_builtin(ptr, ptr, ptr, ptr)
 declare ptr @j_pick(ptr, ptr, ptr)
@@ -450,7 +453,9 @@ namedone:
   store ptr %name, ptr %val.p
   br i1 %dollar, label %variable, label %namekeyword
 variable:
-  store i32 258, ptr %tok.p
+  %bare = icmp eq i64 %nl, 0
+  %bindingtoken = select i1 %bare, i32 36, i32 258
+  store i32 %bindingtoken, ptr %tok.p
   ret void
 namekeyword:
   %ist = call i1 @j_is(ptr %name, ptr @ev_true)
@@ -601,12 +606,46 @@ double:
   ret void
 single:
   %st = zext i8 %ch to i32
+  %stackp = getelementptr %P, ptr %p, i32 0, i32 8
+  %stack = load ptr, ptr %stackp
+  switch i8 %ch, label %singleplain [i8 40, label %pushdelimiter i8 91, label %pushdelimiter i8 123, label %pushdelimiter i8 41, label %popdelimiter i8 93, label %popdelimiter i8 125, label %popdelimiter]
+pushdelimiter:
+  %item = call ptr @j_alloc(i64 16)
+  store ptr %stack, ptr %item
+  %itemcharp = getelementptr i8, ptr %item, i64 8
+  store i8 %ch, ptr %itemcharp
+  store ptr %item, ptr %stackp
+  br label %singleplain
+popdelimiter:
+  %hasstack = icmp ne ptr %stack, null
+  br i1 %hasstack, label %matchdelimiter, label %invaliddelimiter
+matchdelimiter:
+  %stackcharp = getelementptr i8, ptr %stack, i64 8
+  %opener = load i8, ptr %stackcharp
+  %paren = icmp eq i8 %opener, 40
+  %distance = select i1 %paren, i8 1, i8 2
+  %closer = add i8 %opener, %distance
+  %matches = icmp eq i8 %closer, %ch
+  br i1 %matches, label %delimiterdone, label %invaliddelimiter
+delimiterdone:
+  %parent = load ptr, ptr %stack
+  store ptr %parent, ptr %stackp
+  br label %singleplain
+invaliddelimiter:
+  store i32 292, ptr %tok.p
+  ret void
+singleplain:
   store i32 %st, ptr %tok.p
   ret void
 eof:
-  %eofstart.p = getelementptr %P, ptr %p, i32 0, i32 6
-  store i64 %len, ptr %eofstart.p
+  %trailing = icmp ugt i64 %len, %pos
+  br i1 %trailing, label %eofspace, label %eofdone
+eofspace:
+  %eofstartp = getelementptr %P, ptr %p, i32 0, i32 6
+  store i64 %pos, ptr %eofstartp
   store i64 %len, ptr %pos.p
+  br label %eofdone
+eofdone:
   store i32 0, ptr %tok.p
   ret void
 }
@@ -655,7 +694,7 @@ entry:
   ret i64 %end
 }
 
-define internal void @ev_recorderror(ptr %message, i64 %start, i64 %end, i1 %raw) {
+define void @ev_recorderror(ptr %message, i64 %start, i64 %end, i1 %raw) {
 entry:
   %existing = load ptr, ptr @j_compile_errors
   %has = icmp ne ptr %existing, null
@@ -776,7 +815,7 @@ catcherror:
   call void @ev_compileerror(i64 %at, i64 %end, ptr @ev_unexpectedcatch)
   br label %context
 othererror:
-  call void @ev_syntaxerror(i32 %t, i64 %at, i64 %end, i1 false)
+  call void @ev_syntax_expected(i32 %t, i64 %at, i64 %end, ptr @ev_expect_end)
   br label %context
 context:
   %ep = getelementptr %P, ptr %p, i32 0, i32 5
@@ -829,6 +868,27 @@ done:
 
 define internal void @ev_expect(ptr %p, i32 %expected) {
 entry:
+  switch i32 %expected, label %other [i32 41, label %argument i32 93, label %array i32 125, label %object i32 274, label %then i32 58, label %colon]
+argument:
+  br label %call
+array:
+  br label %call
+object:
+  br label %call
+then:
+  br label %call
+colon:
+  br label %call
+other:
+  br label %call
+call:
+  %suffix = phi ptr [@ev_expect_argument, %argument], [@ev_expect_array, %array], [@ev_expect_object, %object], [@ev_expect_then, %then], [@ev_expect_colon, %colon], [null, %other]
+  call void @ev_expect_context(ptr %p, i32 %expected, ptr %suffix)
+  ret void
+}
+
+define internal void @ev_expect_context(ptr %p, i32 %expected, ptr %suffix) {
+entry:
   %t = call i32 @ev_tok(ptr %p)
   %ok = icmp eq i32 %t, %expected
   br i1 %ok, label %yes, label %no
@@ -841,7 +901,7 @@ no:
   %start = call i64 @ev_start(ptr %p)
   %posp = getelementptr %P, ptr %p, i32 0, i32 2
   %end = load i64, ptr %posp
-  call void @ev_compileerror(i64 %start, i64 %end, ptr @ev_syntax)
+  call void @ev_syntax_expected(i32 %t, i64 %start, i64 %end, ptr %suffix)
   ret void
 }
 
@@ -1145,6 +1205,16 @@ dotkey:
   %fieldnode = call ptr @ev_node(i32 5, i32 0, ptr %identity.n, ptr %keynode, ptr null, ptr null)
   br label %postfix
 dotdone:
+  switch i32 %dt, label %dotvalid [i32 36, label %doterror i32 258, label %doterror i32 257, label %doterror i32 292, label %doterror i32 40, label %doterror]
+doterror:
+  %doterrorstart = call i64 @ev_start(ptr %p)
+  %doterrorendp = getelementptr %P, ptr %p, i32 0, i32 2
+  %doterrorend = load i64, ptr %doterrorendp
+  call void @ev_syntax_expected(i32 %dt, i64 %doterrorstart, i64 %doterrorend, ptr null)
+  %hint = call ptr @j_cstr(ptr @ev_fieldhint)
+  call void @ev_recorderror(ptr %hint, i64 %currentstart, i64 %doterrorend, i1 false)
+  br label %dotvalid
+dotvalid:
   br label %postfix
 recursive:
   %recursive.n = call ptr @ev_node(i32 17, i32 0, ptr null, ptr null, ptr null, ptr null)
@@ -1196,7 +1266,7 @@ namecall:
   br label %postfix
 paren:
   %paren.n = call ptr @ev_expr(ptr %p, i32 1)
-  call void @ev_expect(ptr %p, i32 41)
+  call void @ev_expect_context(ptr %p, i32 41, ptr @ev_expect_paren)
   br label %postfix
 array:
   %art = call i32 @ev_tok(ptr %p)
@@ -1448,12 +1518,13 @@ module:
 bad:
   %errp = getelementptr %P, ptr %p, i32 0, i32 5
   store i32 1, ptr %errp
-  call void @ev_syntaxerror(i32 %t, i64 %currentstart, i64 %currentend, i1 true)
+  %atroot = icmp eq i64 %currentstart, 0
+  call void @ev_syntaxerror(i32 %t, i64 %currentstart, i64 %currentend, i1 %atroot)
   %badval = call ptr @j_null()
   %bad.n = call ptr @ev_node(i32 0, i32 0, ptr %badval, ptr null, ptr null, ptr null)
   ret ptr %bad.n
 postfix:
-  %base = phi ptr [%literal.n, %literal], [%string.n, %string], [%fieldnode, %dotkey], [%identity.n, %dotdone], [%recursive.n, %recursive], [%variable.n, %variable], [%format.n, %formatstring], [%call.n, %namecall], [%paren.n, %paren], [%emptyarray.n, %emptyarray], [%array.n, %arraycontent], [%object.n, %objectdone], [%negative.n, %negative], [%if.n, %conditional], [%try.n, %trydone], [%definition.n, %defbody], [%reducer.n, %reddone], [%label.n, %label], [%break.n, %break], [%import.n, %importdone], [%module.n, %module], [%optional.n, %optional], [%suffixfield.n, %suffixfielddone], [%index.n, %indexdone], [%iter.n, %iterate], [%slice.n, %slicedone], [%base, %suffixdot]
+  %base = phi ptr [%literal.n, %literal], [%string.n, %string], [%fieldnode, %dotkey], [%identity.n, %dotvalid], [%recursive.n, %recursive], [%variable.n, %variable], [%format.n, %formatstring], [%call.n, %namecall], [%paren.n, %paren], [%emptyarray.n, %emptyarray], [%array.n, %arraycontent], [%object.n, %objectdone], [%negative.n, %negative], [%if.n, %conditional], [%try.n, %trydone], [%definition.n, %defbody], [%reducer.n, %reddone], [%label.n, %label], [%break.n, %break], [%import.n, %importdone], [%module.n, %module], [%optional.n, %optional], [%suffixfield.n, %suffixfielddone], [%index.n, %indexdone], [%iterator.n, %iterationdone], [%slice.n, %slicedone], [%base, %suffixdot]
   %pt = call i32 @ev_tok(ptr %p)
   switch i32 %pt, label %done [i32 63, label %optional i32 46, label %suffixdot i32 91, label %bracket]
 optional:
@@ -1487,6 +1558,18 @@ bracket:
 iterate:
   call void @ev_next(ptr %p)
   %iter.n = call ptr @ev_node(i32 6, i32 0, ptr %base, ptr null, ptr null, ptr null)
+  %iterationtoken = call i32 @ev_tok(ptr %p)
+  %iterationoptional = icmp eq i32 %iterationtoken, 63
+  br i1 %iterationoptional, label %optionaliteration, label %iterationdone
+optionaliteration:
+  call void @ev_next(ptr %p)
+  %iterationinput = call ptr @ev_node(i32 1, i32 0, ptr null, ptr null, ptr null, ptr null)
+  %iterationnode = call ptr @ev_node(i32 6, i32 0, ptr %iterationinput, ptr null, ptr null, ptr null)
+  %iterationtry = call ptr @ev_node(i32 16, i32 0, ptr %iterationnode, ptr null, ptr null, ptr null)
+  %iterationpipe = call ptr @ev_node(i32 2, i32 0, ptr %base, ptr %iterationtry, ptr null, ptr null)
+  br label %iterationdone
+iterationdone:
+  %iterator.n = phi ptr [%iter.n, %iterate], [%iterationpipe, %optionaliteration]
   br label %postfix
 index:
   %idx = call ptr @ev_expr(ptr %p, i32 1)
@@ -1552,7 +1635,7 @@ nulerror:
   store i64 %depth, ptr @ev_compile_depth
   ret ptr null
 parse:
-  %p = call ptr @j_alloc(i64 64)
+  %p = call ptr @j_alloc(i64 80)
   store ptr %source, ptr %p
   %lp = getelementptr %P, ptr %p, i32 0, i32 1
   store i64 %length, ptr %lp
@@ -1602,6 +1685,7 @@ seterror:
   call void @ev_syntaxerror(i32 %t, i64 %unexpectedstart, i64 %unexpectedend, i1 true)
   br label %returnerror
 returnerror:
+  call void @j_syntax_diagnostics(ptr %source, i64 %length)
   store i64 %depth, ptr @ev_compile_depth
   ret ptr null
 }
@@ -1951,7 +2035,7 @@ keyread:
   %string = icmp eq i32 %tag, 4
   br i1 %string, label %valloop, label %badkey
 badkey:
-  call void @j_fail(ptr @ev_keyerror)
+  call void @j_object_key_error(ptr %key)
   br label %done
 valloop:
   %vj = phi i64 [0, %keyread], [%vnext, %valbody]
@@ -2882,23 +2966,7 @@ no:
 
 define void @ev_itererror(ptr %value) {
 entry:
-  %tag = load i32, ptr %value
-  %isnum = icmp eq i32 %tag, 3
-  %isstr = icmp eq i32 %tag, 4
-  %isnull = icmp eq i32 %tag, 0
-  %t1 = select i1 %isnum, ptr @ev_numbertype, ptr @ev_booleantype
-  %t2 = select i1 %isstr, ptr @ev_stringtype, ptr %t1
-  %t3 = select i1 %isnull, ptr @ev_nulltype, ptr %t2
-  %prefix = call ptr @j_cstr(ptr @ev_iterprefix)
-  %typename = call ptr @j_cstr(ptr %t3)
-  %start = call ptr @j_binary(i32 0, ptr %prefix, ptr %typename)
-  %open = call ptr @j_cstr(ptr @ev_openparen)
-  %withopen = call ptr @j_binary(i32 0, ptr %start, ptr %open)
-  %dump = call ptr @j_dump(ptr %value, i32 0)
-  %withvalue = call ptr @j_binary(i32 0, ptr %withopen, ptr %dump)
-  %close = call ptr @j_cstr(ptr @ev_closeparen)
-  %message = call ptr @j_binary(i32 0, ptr %withvalue, ptr %close)
-  store ptr %message, ptr @j_error
+  call void @j_iteration_error(ptr %value)
   ret void
 }
 
@@ -2978,13 +3046,19 @@ baseloop:
   br i1 %bmore, label %basebody, label %done
 basebody:
   %base = call ptr @j_at(ptr %bases, i64 %bi)
+  %basevalue = call ptr @ev_fetchpath(ptr %input, ptr %base)
   br label %keyloop
 keyloop:
-  %ki = phi i64 [0, %basebody], [%knext, %keybody]
+  %ki = phi i64 [0, %basebody], [%knext, %keyappend]
   %kmore = icmp ult i64 %ki, %kn
   br i1 %kmore, label %keybody, label %basenext
 keybody:
   %key = call ptr @j_at(ptr %keys, i64 %ki)
+  %selected = call ptr @j_get(ptr %basevalue, ptr %key)
+  %keyerror = load ptr, ptr @j_error
+  %keyfailed = icmp ne ptr %keyerror, null
+  br i1 %keyfailed, label %done, label %keyappend
+keyappend:
   %path = call ptr @j_clone(ptr %base)
   call void @j_push(ptr %path, ptr %key)
   call void @j_push(ptr %out, ptr %path)
@@ -3672,6 +3746,22 @@ done:
 @ev_unexpected_prefix = private constant [28 x i8] c"syntax error, unexpected '\00\00"
 @ev_quote = private constant [2 x i8] c"'\00"
 @ev_expecting_eof = private constant [24 x i8] c", expecting end of file\00"
+@ev_syntaxprefix = private constant [26 x i8] c"syntax error, unexpected \00"
+@ev_token_ident = private constant [6 x i8] c"IDENT\00"
+@ev_token_literal = private constant [8 x i8] c"LITERAL\00"
+@ev_token_binding = private constant [8 x i8] c"BINDING\00"
+@ev_token_string = private constant [15 x i8] c"QQSTRING_START\00"
+@ev_token_invalid = private constant [18 x i8] c"INVALID_CHARACTER\00"
+@ev_token_eof = private constant [12 x i8] c"end of file\00"
+@ev_expect_paren = private constant [30 x i8] c", expecting '|' or ',' or ')'\00"
+@ev_expect_argument = private constant [25 x i8] c", expecting ';' or ')'\00\00\00"
+@ev_expect_array = private constant [30 x i8] c", expecting '|' or ',' or ']'\00"
+@ev_expect_index = private constant [37 x i8] c", expecting '|' or ',' or ':' or ']'\00"
+@ev_expect_end = private constant [30 x i8] c", expecting end or '|' or ','\00"
+@ev_expect_then = private constant [31 x i8] c", expecting then or '|' or ','\00"
+@ev_expect_object = private constant [30 x i8] c", expecting '|' or ',' or '}'\00"
+@ev_expect_colon = private constant [16 x i8] c", expecting ':'\00"
+@ev_fieldhint = private constant [60 x i8] c"try .[\22field\22] instead of .field for unusually named fields\00"
 @ev_invalidescape = private constant [53 x i8] c"Invalid escape at line 1, column 4 (while parsing '\22\00"
 @ev_escapeend = private constant [4 x i8] c"\22')\00"
 
@@ -3749,46 +3839,107 @@ done:
   ret void
 }
 
-define internal void @ev_syntaxerror(i32 %token, i64 %start, i64 %end, i1 %expectend) {
+define internal ptr @ev_token_name(i32 %token) {
+entry:
+  switch i32 %token, label %character [i32 0, label %eof i32 256, label %ident i32 257, label %literal i32 258, label %binding i32 290, label %string i32 272, label %as i32 273, label %if i32 274, label %then i32 275, label %else i32 276, label %elif i32 277, label %end i32 278, label %def i32 279, label %reduce i32 280, label %foreach i32 281, label %try i32 282, label %catch i32 283, label %and i32 284, label %or i32 285, label %label i32 286, label %break i32 287, label %include i32 288, label %import i32 291, label %module]
+eof:
+  br label %named
+ident:
+  br label %named
+literal:
+  br label %named
+binding:
+  br label %named
+string:
+  br label %named
+as:
+  br label %named
+if:
+  br label %named
+then:
+  br label %named
+else:
+  br label %named
+elif:
+  br label %named
+end:
+  br label %named
+def:
+  br label %named
+reduce:
+  br label %named
+foreach:
+  br label %named
+try:
+  br label %named
+catch:
+  br label %named
+and:
+  br label %named
+or:
+  br label %named
+label:
+  br label %named
+break:
+  br label %named
+include:
+  br label %named
+import:
+  br label %named
+module:
+  br label %named
+invalid:
+  br label %named
+named:
+  %name = phi ptr [@ev_token_eof, %eof], [@ev_token_ident, %ident], [@ev_token_literal, %literal], [@ev_token_binding, %binding], [@ev_token_string, %string], [@ev_as, %as], [@ev_if, %if], [@ev_then, %then], [@ev_else, %else], [@ev_elif, %elif], [@ev_end, %end], [@ev_def, %def], [@ev_reduce, %reduce], [@ev_foreach, %foreach], [@ev_try, %try], [@ev_catch, %catch], [@ev_and, %and], [@ev_or, %or], [@ev_label, %label], [@ev_break, %break], [@ev_include, %include], [@ev_import, %import], [@ev_module, %module], [@ev_token_invalid, %invalid]
+  %value = call ptr @j_cstr(ptr %name)
+  ret ptr %value
+character:
+  switch i32 %token, label %invalid [i32 46, label %quoted i32 63, label %quoted i32 61, label %quoted i32 59, label %quoted i32 44, label %quoted i32 58, label %quoted i32 124, label %quoted i32 43, label %quoted i32 45, label %quoted i32 42, label %quoted i32 47, label %quoted i32 37, label %quoted i32 36, label %quoted i32 60, label %quoted i32 62, label %quoted i32 40, label %quoted i32 41, label %quoted i32 91, label %quoted i32 93, label %quoted i32 123, label %quoted i32 125, label %quoted]
+quoted:
+  %bytes = alloca [3 x i8]
+  store i8 39, ptr %bytes
+  %middle = getelementptr i8, ptr %bytes, i64 1
+  %last = getelementptr i8, ptr %bytes, i64 2
+  %ch = trunc i32 %token to i8
+  store i8 %ch, ptr %middle
+  store i8 39, ptr %last
+  %text = call ptr @j_str(ptr %bytes, i64 3)
+  ret ptr %text
+}
+
+define internal void @ev_syntax_expected(i32 %token, i64 %start, i64 %end, ptr %expected) {
 entry:
   %existing = load ptr, ptr @j_error
   %clear = icmp eq ptr %existing, null
-  br i1 %clear, label %dispatch, label %done
-dispatch:
-  switch i32 %token, label %character [i32 0, label %eof i32 125, label %invalid]
-eof:
-  %nonzero = icmp ugt i64 %start, 0
-  %previous = sub i64 %start, 1
-  %at = select i1 %nonzero, i64 %previous, i64 0
-  %after = add i64 %at, 1
-  call void @ev_compileerror(i64 %at, i64 %after, ptr @ev_unexpected_eof)
-  br label %done
-invalid:
-  call void @ev_compileerror(i64 %start, i64 %end, ptr @ev_unexpected_invalid)
-  br label %done
-character:
-  %prefix = call ptr @j_cstr(ptr @ev_unexpected_prefix)
-  %byte = alloca i8
-  %ch = trunc i32 %token to i8
-  store i8 %ch, ptr %byte
-  %text = call ptr @j_str(ptr %byte, i64 1)
-  %withchar = call ptr @j_binary(i32 0, ptr %prefix, ptr %text)
-  %quote = call ptr @j_cstr(ptr @ev_quote)
-  %quoted = call ptr @j_binary(i32 0, ptr %withchar, ptr %quote)
-  br i1 %expectend, label %expected, label %plain
-expected:
-  %suffix = call ptr @j_cstr(ptr @ev_expecting_eof)
-  %full = call ptr @j_binary(i32 0, ptr %quoted, ptr %suffix)
-  br label %raise
-plain:
+  br i1 %clear, label %format, label %done
+format:
+  %prefix = call ptr @j_cstr(ptr @ev_syntaxprefix)
+  %text = call ptr @ev_token_name(i32 %token)
+  %base = call ptr @j_binary(i32 0, ptr %prefix, ptr %text)
+  %hasexpected = icmp ne ptr %expected, null
+  br i1 %hasexpected, label %suffix, label %raise
+suffix:
+  %tail = call ptr @j_cstr(ptr %expected)
+  %full = call ptr @j_binary(i32 0, ptr %base, ptr %tail)
   br label %raise
 raise:
-  %message = phi ptr [%full, %expected], [%quoted, %plain]
+  %message = phi ptr [%full, %suffix], [%base, %format]
   store ptr %message, ptr @j_error
   store i64 %start, ptr @j_compile_error_start
   store i64 %end, ptr @j_compile_error_end
+  call void @ev_recorderror(ptr %message, i64 %start, i64 %end, i1 false)
   br label %done
 done:
+  ret void
+}
+
+define internal void @ev_syntaxerror(i32 %token, i64 %start, i64 %end, i1 %expectend) {
+  %iseof = icmp eq i32 %token, 0
+  %notend = xor i1 %iseof, true
+  %hasexpected = and i1 %notend, %expectend
+  %expected = select i1 %hasexpected, ptr @ev_expecting_eof, ptr null
+  call void @ev_syntax_expected(i32 %token, i64 %start, i64 %end, ptr %expected)
   ret void
 }
 
@@ -4527,6 +4678,7 @@ done:
   store i64 %start, ptr @j_compile_error_start
   store i64 %end, ptr @j_compile_error_end
   store ptr %message, ptr @j_error
+  call void @ev_recorderror(ptr %message, i64 %start, i64 %end, i1 false)
   ret void
 }
 
@@ -4581,10 +4733,7 @@ done:
 define internal void @ev_validate_function(ptr %definition) {
 entry:
   %missing = icmp eq ptr %definition, null
-  %error = load ptr, ptr @j_error
-  %failed = icmp ne ptr %error, null
-  %stop = or i1 %missing, %failed
-  br i1 %stop, label %done, label %begin
+  br i1 %missing, label %done, label %begin
 begin:
   %capturep = getelementptr %E, ptr %definition, i32 0, i32 5
   %capture = load ptr, ptr %capturep
@@ -4653,10 +4802,7 @@ done:
 define internal void @ev_validate(ptr %node, ptr %env) {
 entry:
   %none = icmp eq ptr %node, null
-  %error = load ptr, ptr @j_error
-  %failed = icmp ne ptr %error, null
-  %stop = or i1 %none, %failed
-  br i1 %stop, label %done, label %dispatch
+  br i1 %none, label %done, label %dispatch
 dispatch:
   %kind = load i32, ptr %node
   %ap = getelementptr %N, ptr %node, i32 0, i32 2

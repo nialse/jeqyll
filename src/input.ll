@@ -18,6 +18,7 @@
 @in_abandoned = private constant [33 x i8] c"Unfinished abandoned text at EOF\00"
 @in_truncated = private constant [16 x i8] c"Truncated value\00"
 @in_warning = private constant [27 x i8] c"jq: ignoring parse error: \00"
+@in_resync = private constant [21 x i8] c" (need RS to resync)\00"
 @in_eof = private constant [8 x i8] c" at EOF\00"
 @in_at = private constant [10 x i8] c" at line \00"
 @in_column = private constant [10 x i8] c", column \00"
@@ -29,6 +30,9 @@
 @in_separator = private constant [35 x i8] c"Expected separator between values\00\00"
 @in_parts = private constant [41 x i8] c"Objects must consist of key:value pairs\00\00"
 @in_keys = private constant [29 x i8] c"Object keys must be strings\00\00"
+@in_nokey = private constant [31 x i8] c"Expected string key before ':'\00"
+@in_novalue = private constant [26 x i8] c"Expected value before ','\00"
+@in_colonoutside = private constant [29 x i8] c"':' not as part of an object\00"
 @in_object_object = private constant [39 x i8] c"Expected string key after '{', not '{'\00"
 @in_object_array = private constant [39 x i8] c"Expected string key after '{', not '['\00"
 @in_comma_object = private constant [49 x i8] c"Expected string key after ',' in object, not '{'\00"
@@ -61,6 +65,8 @@ declare ptr @j_buffer_new()
 declare void @j_buffer_append(ptr, ptr, i64)
 declare void @j_buffer_byte(ptr, i8)
 declare ptr @j_buffer_value(ptr)
+declare i32 @j_utf8_next(ptr, i64, ptr)
+declare i64 @j_utf8_put(ptr, i32)
 declare i64 @read(i32, ptr, i64)
 declare i64 @write(i32, ptr, i64)
 declare i32 @open(ptr, i32, i32)
@@ -84,6 +90,16 @@ define internal i1 @in_flag(ptr %reader, i32 %mask) {
   %bits = and i32 %flags, %mask
   %set = icmp ne i32 %bits, 0
   ret i1 %set
+}
+
+define void @j_input_defer(ptr %reader, i1 %defer) {
+  %flagp = getelementptr %Input, ptr %reader, i32 0, i32 2
+  %flags = load i32, ptr %flagp
+  %base = and i32 %flags, -3
+  %bit = select i1 %defer, i32 2, i32 0
+  %next = or i32 %base, %bit
+  store i32 %next, ptr %flagp
+  ret void
 }
 
 define ptr @j_input_new(ptr %files, i32 %flags) {
@@ -428,11 +444,7 @@ location:
   %statusp = getelementptr %Input, ptr %reader, i32 0, i32 11
   store i32 5, ptr %statusp
   %lastp = getelementptr %Input, ptr %reader, i32 0, i32 10
-  %zerocol = icmp eq i64 %column, 0
-  %notfirst = icmp ugt i64 %line, 1
-  %previous = and i1 %zerocol, %notfirst
-  %dec = zext i1 %previous to i64
-  %contextline = sub i64 %line, %dec
+  %contextline = call i64 @in_position_line(ptr %reader)
   store i64 %contextline, ptr %lastp
   ret void
 }
@@ -518,12 +530,28 @@ parsevalue:
   %total = call i64 @in_len(ptr %fulltoken)
   %offset = alloca i64
   store i64 0, ptr %offset
-  %value = call ptr @j_parse(ptr %data, i64 %total, ptr %offset)
+  %prefixlength = call i64 @j_strlen(ptr %data)
+  %embeddednul = icmp ult i64 %prefixlength, %length
+  %leadingbyte = load i8, ptr %data
+  %truefirst = icmp eq i8 %leadingbyte, 116
+  %falsefirst = icmp eq i8 %leadingbyte, 102
+  %nullfirst = icmp eq i8 %leadingbyte, 110
+  %boolfirst = or i1 %truefirst, %falsefirst
+  %literalfirst = or i1 %boolfirst, %nullfirst
+  %numberfirst = xor i1 %literalfirst, true
+  %unquoted = xor i1 %quoted, true
+  %numbertoken = and i1 %numberfirst, %unquoted
+  %prefixpresent = icmp ne i64 %prefixlength, 0
+  %numberprefix = and i1 %numbertoken, %prefixpresent
+  %nulnumber = and i1 %embeddednul, %numberprefix
+  %parselength = select i1 %nulnumber, i64 %prefixlength, i64 %total
+  %value = call ptr @j_parse(ptr %data, i64 %parselength, ptr %offset)
   %valid = icmp ne ptr %value, null
   br i1 %valid, label %complete, label %error
 complete:
   %used = load i64, ptr %offset
-  %allused = icmp eq i64 %used, %length
+  %expectedlength = select i1 %nulnumber, i64 %prefixlength, i64 %length
+  %allused = icmp eq i64 %used, %expectedlength
   br i1 %allused, label %ambiguouscheck, label %trailing
 trailing:
   %tag = load i32, ptr %value
@@ -548,11 +576,32 @@ numbererror:
   %numberdepthp = getelementptr %Input, ptr %reader, i32 0, i32 21
   %numberdepth = load i64, ptr %numberdepthp
   %topnumber = icmp eq i64 %numberdepth, 0
-  %numbercause = zext i1 %topnumber to i32
+  %numbercause = select i1 %topnumber, i32 1, i32 3
   store i32 %numbercause, ptr %causep
   call void @in_error_here(ptr %reader, ptr @in_abandoned, i1 false)
   ret ptr null
 success:
+  %successdepthp = getelementptr %Input, ptr %reader, i32 0, i32 21
+  %successdepth = load i64, ptr %successdepthp
+  %successroot = icmp eq i64 %successdepth, 0
+  %plainroot = and i1 %successroot, %unquoted
+  br i1 %plainroot, label %rootterminator, label %successvalue
+rootterminator:
+  switch i32 %terminator, label %successvalue [i32 44, label %rootcomma i32 58, label %rootcolon i32 93, label %rootarray i32 125, label %rootobject]
+rootcomma:
+  br label %rooterror
+rootcolon:
+  br label %rooterror
+rootarray:
+  br label %rooterror
+rootobject:
+  br label %rooterror
+rooterror:
+  %rootreason = phi ptr [@in_novalue, %rootcomma], [@in_nokey, %rootcolon], [@in_unmatched_array, %rootarray], [@in_unmatched_object, %rootobject]
+  call void @in_take(ptr %reader, i32 %terminator)
+  call void @in_error_here(ptr %reader, ptr %rootreason, i1 false)
+  ret ptr null
+successvalue:
   ret ptr %value
 error:
   %message = load ptr, ptr @j_parse_error_message
@@ -578,6 +627,20 @@ locatebyte:
   %next = add i64 %i, 1
   br label %locate
 report:
+  %plainfailure = xor i1 %quoted, true
+  %consumable = icmp sge i32 %terminator, 0
+  %ordinaryend = and i1 %consumable, %notrs
+  %consumeend = and i1 %plainfailure, %ordinaryend
+  br i1 %consumeend, label %consumefailureend, label %reporterror
+consumefailureend:
+  call void @in_take(ptr %reader, i32 %terminator)
+  br label %reporterror
+reporterror:
+  %errorrecord = icmp eq i32 %terminator, 30
+  %truncatedrecord = and i1 %sequence, %errorrecord
+  %errorcause = select i1 %truncatedrecord, i32 3, i32 0
+  %errorcausep = getelementptr %Input, ptr %reader, i32 0, i32 23
+  store i32 %errorcause, ptr %errorcausep
   call void @in_error(ptr %reader, ptr %message, i1 %eof, i64 %line, i64 %column)
   ret ptr null
 failure:
@@ -648,6 +711,18 @@ parent:
   %f = call ptr @in_frame(ptr %reader, i64 %index)
   %kind = load i32, ptr %f
   %array = icmp eq i32 %kind, 5
+  %parentstatep = getelementptr %InputFrame, ptr %f, i32 0, i32 1
+  %parentstate = load i32, ptr %parentstatep
+  %firstkey = icmp eq i32 %parentstate, 3
+  %nextkey = icmp eq i32 %parentstate, 7
+  %keypending = or i1 %firstkey, %nextkey
+  br i1 %keypending, label %savekey, label %commit
+savekey:
+  %savedkeyp = getelementptr %InputFrame, ptr %f, i32 0, i32 3
+  store ptr %value, ptr %savedkeyp
+  store i32 4, ptr %parentstatep
+  br label %done
+commit:
   %stream = call i1 @in_flag(ptr %reader, i32 1024)
   br i1 %stream, label %advance, label %append
 append:
@@ -708,7 +783,31 @@ define internal i1 @in_seq_recover(ptr %reader) {
 entry:
   %causep = getelementptr %Input, ptr %reader, i32 0, i32 23
   %cause = load i32, ptr %causep
-  br label %scan
+  %original = load ptr, ptr @j_error
+  %originaleof = load i1, ptr @j_parse_error_eof
+  %originalreason = load ptr, ptr @j_parse_error_message
+  %hasreason = icmp ne ptr %originalreason, null
+  %safereason = select i1 %hasreason, ptr %originalreason, ptr @in_unfinished
+  %reasonvalue = call ptr @j_cstr(ptr %safereason)
+  %numericerror = call i1 @j_is(ptr %reasonvalue, ptr @in_number)
+  %literalerror = call i1 @j_is(ptr %reasonvalue, ptr @in_literal)
+  %tokenerror = or i1 %numericerror, %literalerror
+  %preserve = and i1 %originaleof, %tokenerror
+  %hasoriginal = icmp ne ptr %original, null
+  %plaincause = icmp eq i32 %cause, 0
+  %direct = and i1 %hasoriginal, %plaincause
+  br i1 %direct, label %existingerror, label %scan
+existingerror:
+  br i1 %originaleof, label %reset, label %resynchint
+resynchint:
+  %hintbuffer = call ptr @j_buffer_new()
+  %originaldata = call ptr @in_data(ptr %original)
+  %originallength = call i64 @in_len(ptr %original)
+  call void @j_buffer_append(ptr %hintbuffer, ptr %originaldata, i64 %originallength)
+  call void @in_text(ptr %hintbuffer, ptr @in_resync)
+  %hintmessage = call ptr @j_buffer_value(ptr %hintbuffer)
+  store ptr %hintmessage, ptr @j_error
+  br label %reset
 scan:
   %c = call i32 @in_peek(ptr %reader)
   %end = icmp slt i32 %c, 0
@@ -730,7 +829,11 @@ eofreason:
   br label %report
 report:
   %reason = phi ptr [ @in_truncated, %separator ], [ %endreason, %eofreason ]
+  br i1 %preserve, label %reset, label %replace
+replace:
   call void @in_error_here(ptr %reader, ptr %reason, i1 false)
+  br label %reset
+reset:
   %depthp = getelementptr %Input, ptr %reader, i32 0, i32 21
   store i64 0, ptr %depthp
   %defer = call i1 @in_flag(ptr %reader, i32 2)
@@ -751,6 +854,67 @@ ioerror:
   br label %failed
 failed:
   ret i1 true
+}
+
+define internal i1 @in_stream_finish(ptr %reader) {
+entry:
+  %depthp = getelementptr %Input, ptr %reader, i32 0, i32 21
+  %depth = load i64, ptr %depthp
+  %index = sub i64 %depth, 1
+  %frame = call ptr @in_frame(ptr %reader, i64 %index)
+  %kind = load i32, ptr %frame
+  %array = icmp eq i32 %kind, 5
+  %close = select i1 %array, i32 93, i32 125
+  br label %space
+space:
+  %c = call i32 @in_peek(ptr %reader)
+  %white = call i1 @in_white(i32 %c)
+  br i1 %white, label %skip, label %check
+skip:
+  call void @in_take(ptr %reader, i32 %c)
+  br label %space
+check:
+  %comma = icmp eq i32 %c, 44
+  %closing = icmp eq i32 %c, %close
+  %valid = or i1 %comma, %closing
+  br i1 %valid, label %done, label %eofcheck
+done:
+  ret i1 true
+eofcheck:
+  %eof = icmp eq i32 %c, -1
+  br i1 %eof, label %unfinished, label %recordcheck
+unfinished:
+  call void @in_error_here(ptr %reader, ptr @in_unfinished, i1 true)
+  ret i1 false
+recordcheck:
+  %sequence = call i1 @in_flag(ptr %reader, i32 512)
+  %rs = icmp eq i32 %c, 30
+  %record = and i1 %sequence, %rs
+  br i1 %record, label %failed, label %tokencheck
+tokencheck:
+  %boundary = call i1 @in_boundary(i32 %c)
+  %quote = icmp eq i32 %c, 34
+  %plain = xor i1 %boundary, true
+  %token = or i1 %plain, %quote
+  br i1 %token, label %parse, label %delimiter
+parse:
+  %extra = call ptr @in_token(ptr %reader)
+  %invalid = icmp eq ptr %extra, null
+  br i1 %invalid, label %failed, label %parsed
+parsed:
+  br i1 %quote, label %separator, label %delimiter
+delimiter:
+  %end = call i32 @in_peek(ptr %reader)
+  %hasend = icmp sge i32 %end, 0
+  br i1 %hasend, label %consume, label %separator
+consume:
+  call void @in_take(ptr %reader, i32 %end)
+  br label %separator
+separator:
+  call void @in_error_here(ptr %reader, ptr @in_separator, i1 false)
+  br label %failed
+failed:
+  ret i1 false
 }
 
 define internal ptr @in_json(ptr %reader) {
@@ -899,6 +1063,8 @@ objectkey:
   %keycontainer = or i1 %keyobject, %keyarray
   br i1 %keycontainer, label %containerkeyerror, label %parsekey
 containerkeyerror:
+  br i1 %stream, label %streamkeyerror, label %value
+streamkeyerror:
   %firstkey = icmp eq i32 %statevalue, 3
   %arrayreason = select i1 %firstkey, ptr @in_object_array, ptr @in_comma_array
   %objectreason = select i1 %firstkey, ptr @in_object_object, ptr @in_comma_object
@@ -912,9 +1078,7 @@ parsekey:
   %keyfailed = icmp eq ptr %key, null
   br i1 %keyfailed, label %problem, label %keytype
 keytype:
-  %keytag = load i32, ptr %key
-  %stringkey = icmp eq i32 %keytag, 4
-  br i1 %stringkey, label %storekey, label %keyerror
+  br label %storekey
 keyerror:
   call void @in_error_here(ptr %reader, ptr @in_keys, i1 false)
   br label %problem
@@ -924,9 +1088,23 @@ storekey:
   store i32 4, ptr %statep
   br label %loop
 colon:
-  call void @in_take(ptr %reader, i32 %c)
   %iscolon = icmp eq i32 %c, 58
-  br i1 %iscolon, label %colonvalue, label %colonerror
+  br i1 %iscolon, label %colonkeycheck, label %colonother
+colonkeycheck:
+  call void @in_take(ptr %reader, i32 %c)
+  %colonkeyp = getelementptr %InputFrame, ptr %frame, i32 0, i32 3
+  %colonkey = load ptr, ptr %colonkeyp
+  %colonkeytag = load i32, ptr %colonkey
+  %validcolonkey = icmp eq i32 %colonkeytag, 4
+  br i1 %validcolonkey, label %colonvalue, label %keyerror
+colonother:
+  %coloncomma = icmp eq i32 %c, 44
+  %colonclose = icmp eq i32 %c, 125
+  %colonstructural = or i1 %coloncomma, %colonclose
+  br i1 %colonstructural, label %colonconsume, label %separatorerror
+colonconsume:
+  call void @in_take(ptr %reader, i32 %c)
+  br label %colonerror
 colonvalue:
   store i32 5, ptr %statep
   br label %loop
@@ -947,7 +1125,33 @@ commaadvance:
   store i32 %nextstate, ptr %statep
   br label %loop
 separatorerror:
+  %boundary = call i1 @in_boundary(i32 %c)
+  %separatorquote = icmp eq i32 %c, 34
+  %nonquote = xor i1 %separatorquote, true
+  %structuralboundary = and i1 %boundary, %nonquote
+  br i1 %structuralboundary, label %separatordelimiter, label %separatortoken
+separatortoken:
+  %extra = call ptr @in_token(ptr %reader)
+  %invalidtoken = icmp eq ptr %extra, null
+  br i1 %invalidtoken, label %problem, label %separatorextra
+separatorextra:
+  br i1 %separatorquote, label %separatorreport, label %separatorend
+separatorend:
+  %separatorchar = call i32 @in_peek(ptr %reader)
+  %separatorhaschar = icmp sge i32 %separatorchar, 0
+  br i1 %separatorhaschar, label %separatortake, label %separatorreport
+separatortake:
+  call void @in_take(ptr %reader, i32 %separatorchar)
+  br label %separatorreport
+separatordelimiter:
   call void @in_take(ptr %reader, i32 %c)
+  %extracolon = icmp eq i32 %c, 58
+  br i1 %extracolon, label %outsidecolon, label %separatorreport
+outsidecolon:
+  call void @in_error_here(ptr %reader, ptr @in_colonoutside, i1 false)
+  br label %problem
+  br label %separatorreport
+separatorreport:
   call void @in_error_here(ptr %reader, ptr @in_separator, i1 false)
   br label %problem
 containerclose:
@@ -1015,14 +1219,25 @@ unmatchedobject:
   br label %problem
 unexpected:
   call void @in_take(ptr %reader, i32 %c)
-  call void @in_error_here(ptr %reader, ptr @in_number, i1 false)
+  %unexpectedcolon = icmp eq i32 %c, 58
+  %unexpectedreason = select i1 %unexpectedcolon, ptr @in_nokey, ptr @in_novalue
+  call void @in_error_here(ptr %reader, ptr %unexpectedreason, i1 false)
   br label %problem
 scalar:
   %atom = call ptr @in_token(ptr %reader)
   %atomfailed = icmp eq ptr %atom, null
-  br i1 %atomfailed, label %problem, label %accept
+  br i1 %atomfailed, label %problem, label %scalarstream
+scalarstream:
+  %inscalarcontainer = icmp ne i64 %depth, 0
+  %scalarpending = and i1 %stream, %inscalarcontainer
+  br i1 %scalarpending, label %scalarfinish, label %scalarready
+scalarfinish:
+  %scalarcomplete = call i1 @in_stream_finish(ptr %reader)
+  br i1 %scalarcomplete, label %scalarready, label %problem
+scalarready:
+  br label %accept
 accept:
-  %accepted = phi ptr [ %closedvalue, %containerready ], [ %atom, %scalar ]
+  %accepted = phi ptr [ %closedvalue, %containerready ], [ %atom, %scalarready ]
   br i1 %stream, label %streampair, label %commitvalue
 streampair:
   %path = call ptr @in_path(ptr %reader)
@@ -1039,7 +1254,7 @@ commitvalue:
 returned:
   %result = phi ptr [ %ending, %streamclose ], [ %pair, %streampair ], [ %accepted, %commitvalue ]
   %lineno = getelementptr %Input, ptr %reader, i32 0, i32 8
-  %line = load i64, ptr %lineno
+  %line = call i64 @in_position_line(ptr %reader)
   %lastp = getelementptr %Input, ptr %reader, i32 0, i32 10
   store i64 %line, ptr %lastp
   ret ptr %result
@@ -1055,7 +1270,7 @@ recover:
 ordinaryerror:
   %errorvalue = load ptr, ptr @j_error
   %errorpath = load ptr, ptr @j_parse_error_path
-  call void @j_input_close(ptr %reader)
+  call void @in_discard_chunk(ptr %reader)
   store i64 0, ptr %depthp
   %streamerrors = call i1 @in_flag(ptr %reader, i32 16384)
   br i1 %streamerrors, label %errorevent, label %finish
@@ -1073,6 +1288,92 @@ ioerror:
   br label %finish
 finish:
   ret ptr null
+}
+
+define internal void @in_discard_chunk(ptr %reader) {
+entry:
+  %cp = getelementptr %Input, ptr %reader, i32 0, i32 9
+  %column = load i64, ptr %cp
+  %part = urem i64 %column, 4091
+  %remaining = sub i64 4091, %part
+  %newline = icmp eq i64 %column, 0
+  br i1 %newline, label %done, label %loop
+loop:
+  %i = phi i64 [0, %entry], [%next, %consume]
+  %room = icmp ult i64 %i, %remaining
+  br i1 %room, label %peek, label %done
+peek:
+  %c = call i32 @in_peek(ptr %reader)
+  %end = icmp slt i32 %c, 0
+  br i1 %end, label %done, label %consume
+consume:
+  call void @in_take(ptr %reader, i32 %c)
+  %lf = icmp eq i32 %c, 10
+  %next = add i64 %i, 1
+  br i1 %lf, label %done, label %loop
+done:
+  ret void
+}
+
+define internal i64 @in_position_line(ptr %reader) {
+entry:
+  %lp = getelementptr %Input, ptr %reader, i32 0, i32 8
+  %line = load i64, ptr %lp
+  %cp = getelementptr %Input, ptr %reader, i32 0, i32 9
+  %column = load i64, ptr %cp
+  %previous = sub i64 %line, 1
+  %newline = icmp eq i64 %column, 0
+  br i1 %newline, label %withoutnewline, label %scanstart
+scanstart:
+  %pp = getelementptr %Input, ptr %reader, i32 0, i32 6
+  %ep = getelementptr %Input, ptr %reader, i32 0, i32 7
+  %bp = getelementptr %Input, ptr %reader, i32 0, i32 5
+  %position = load i64, ptr %pp
+  %end = load i64, ptr %ep
+  %buffer = load ptr, ptr %bp
+  %chunkcolumn = urem i64 %column, 4091
+  %remaining = sub i64 4091, %chunkcolumn
+  %limit = add i64 %position, %remaining
+  br label %scan
+scan:
+  %i = phi i64 [%position, %scanstart], [%next, %byte]
+  %available = icmp ult i64 %i, %end
+  %inchunk = icmp ult i64 %i, %limit
+  %more = and i1 %available, %inchunk
+  br i1 %more, label %byte, label %withoutnewline
+byte:
+  %p = getelementptr i8, ptr %buffer, i64 %i
+  %c = load i8, ptr %p
+  %lf = icmp eq i8 %c, 10
+  %next = add i64 %i, 1
+  br i1 %lf, label %withnewline, label %scan
+withnewline:
+  ret i64 %line
+withoutnewline:
+  ret i64 %previous
+}
+
+define internal ptr @in_utf8(ptr %value) {
+entry:
+  %data = call ptr @in_data(ptr %value)
+  %length = call i64 @in_len(ptr %value)
+  %out = call ptr @j_buffer_new()
+  %offset = alloca i64
+  %encoded = alloca [4 x i8]
+  store i64 0, ptr %offset
+  br label %loop
+loop:
+  %position = load i64, ptr %offset
+  %more = icmp ult i64 %position, %length
+  br i1 %more, label %character, label %done
+character:
+  %codepoint = call i32 @j_utf8_next(ptr %data, i64 %length, ptr %offset)
+  %size = call i64 @j_utf8_put(ptr %encoded, i32 %codepoint)
+  call void @j_buffer_append(ptr %out, ptr %encoded, i64 %size)
+  br label %loop
+done:
+  %result = call ptr @j_buffer_value(ptr %out)
+  ret ptr %result
 }
 
 define internal ptr @in_raw_line(ptr %reader) {
@@ -1115,7 +1416,8 @@ value:
   %linevalue = call ptr @j_buffer_value(ptr %b)
   %lastp = getelementptr %Input, ptr %reader, i32 0, i32 10
   store i64 %line, ptr %lastp
-  ret ptr %linevalue
+  %validline = call ptr @in_utf8(ptr %linevalue)
+  ret ptr %validline
 error:
   call void @j_input_close(ptr %reader)
   br label %finish
@@ -1216,10 +1518,12 @@ rawresult:
   store ptr null, ptr %accp
   %rawvalue = call ptr @j_buffer_value(ptr %b)
   %lp = getelementptr %Input, ptr %reader, i32 0, i32 8
-  %lastline = load i64, ptr %lp
+  %parserline = load i64, ptr %lp
+  %lastline = sub i64 %parserline, 1
   %lastp = getelementptr %Input, ptr %reader, i32 0, i32 10
   store i64 %lastline, ptr %lastp
-  ret ptr %rawvalue
+  %validraw = call ptr @in_utf8(ptr %rawvalue)
+  ret ptr %validraw
 rawerror:
   call void @j_input_close(ptr %reader)
   br label %finish

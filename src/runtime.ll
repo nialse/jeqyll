@@ -846,7 +846,7 @@ entry:
   %valid = icmp eq i32 %tag, 4
   br i1 %valid, label %start, label %error
 error:
-  call void @j_fail(ptr @error_key)
+  call void @j_object_key_error(ptr %key)
   ret void
 start:
   %lp = getelementptr %V, ptr %object, i32 0, i32 3
@@ -1169,8 +1169,7 @@ width:
   %wide = select i1 %three, i64 3, i64 4
   %n = select i1 %two, i64 2, i64 %wide
   %stop = add i64 %i, %n
-  %truncated = icmp ugt i64 %stop, %length
-  br i1 %truncated, label %invalid, label %decode
+  br label %decode
 decode:
   %mask3 = select i1 %three, i32 15, i32 7
   %mask = select i1 %two, i32 31, i32 %mask3
@@ -1182,6 +1181,10 @@ loop:
   %done = icmp eq i64 %j, %n
   br i1 %done, label %validate, label %continuation
 continuation:
+  %byteindex = add i64 %i, %j
+  %available = icmp ult i64 %byteindex, %length
+  br i1 %available, label %continuationbyte, label %invalid
+continuationbyte:
   %q = getelementptr i8, ptr %p, i64 %j
   %cb = load i8, ptr %q
   %top = and i8 %cb, -64
@@ -1193,8 +1196,11 @@ append:
   %shift = shl i32 %code, 6
   %updated = or i32 %shift, %ext
   %jn = add i64 %j, 1
+  %consumed = add i64 %i, %jn
+  store i64 %consumed, ptr %offset
   br label %loop
 validate:
+  store i64 %stop, ptr %offset
   %min3 = select i1 %three, i32 2048, i32 65536
   %minimum = select i1 %two, i32 128, i32 %min3
   %overlong = icmp ult i32 %code, %minimum
@@ -1266,7 +1272,7 @@ define internal i64 @json_space(ptr %data, i64 %length, i64 %start) {
 entry:
   br label %loop
 loop:
-  %i = phi i64 [ %start, %entry ], [ %next, %skip ], [ %bomnext, %bomskip ]
+  %i = phi i64 [ %start, %entry ], [ %next, %skip ]
   %end = icmp uge i64 %i, %length
   br i1 %end, label %done, label %body
 body:
@@ -1279,27 +1285,9 @@ body:
   %w1 = or i1 %space, %tab
   %w2 = or i1 %lf, %cr
   %ws = or i1 %w1, %w2
-  br i1 %ws, label %skip, label %bomcheck
+  br i1 %ws, label %skip, label %done
 skip:
   %next = add i64 %i, 1
-  br label %loop
-bomcheck:
-  %bom = icmp eq i8 %c, -17
-  %room = add i64 %i, 2
-  %has = icmp ult i64 %room, %length
-  %possible = and i1 %bom, %has
-  br i1 %possible, label %bomrest, label %done
-bomrest:
-  %b1p = getelementptr i8, ptr %p, i64 1
-  %b2p = getelementptr i8, ptr %p, i64 2
-  %b1 = load i8, ptr %b1p
-  %b2 = load i8, ptr %b2p
-  %ok1 = icmp eq i8 %b1, -69
-  %ok2 = icmp eq i8 %b2, -65
-  %ok = and i1 %ok1, %ok2
-  br i1 %ok, label %bomskip, label %done
-bomskip:
-  %bomnext = add i64 %i, 3
   br label %loop
 done:
   ret i64 %i
@@ -2653,8 +2641,9 @@ coefficientloop:
 format:
   %places = add i32 %clennext, %power10
   %exponent = sub i32 %places, 1
-  %large = icmp sge i32 %exponent, 21
-  %small = icmp slt i32 %exponent, -6
+  %fixedlimit = add i32 %clennext, 15
+  %large = icmp sgt i32 %places, %fixedlimit
+  %small = icmp sle i32 %places, -4
   %scientific = or i1 %large, %small
   br i1 %scientific, label %scientificstart, label %fixedstart
 scientificstart:
@@ -2685,6 +2674,12 @@ scientificexponent:
   %enegated = sub i32 0, %exponent
   %eabs = select i1 %eneg, i32 %enegated, i32 %exponent
   %eu = zext i32 %eabs to i64
+  %onedigit = icmp ult i32 %eabs, 10
+  br i1 %onedigit, label %exponentzero, label %exponentdigits
+exponentzero:
+  call void @buffer_byte(ptr %b, i8 48)
+  br label %exponentdigits
+exponentdigits:
   call void @buffer_uint(ptr %b, i64 %eu)
   ret void
 fixedstart:
@@ -3093,6 +3088,30 @@ define void @j_index_error(ptr %value, ptr %key) {
   ret void
 }
 
+@text_cannot_use = private constant [12 x i8] c"Cannot use \00"
+@text_object_key = private constant [15 x i8] c" as object key\00"
+
+define void @j_object_key_error(ptr %key) {
+  %buffer = call ptr @buffer_new()
+  call void @buffer_append(ptr %buffer, ptr @text_cannot_use, i64 11)
+  call void @describe_value(ptr %buffer, ptr %key)
+  call void @buffer_append(ptr %buffer, ptr @text_object_key, i64 14)
+  %message = call ptr @buffer_value(ptr %buffer)
+  store ptr %message, ptr @j_error
+  ret void
+}
+
+define void @j_iteration_error(ptr %value) {
+  %buffer = call ptr @buffer_new()
+  call void @buffer_append(ptr %buffer, ptr @text_cannot_iterate, i64 20)
+  call void @describe_value(ptr %buffer, ptr %value)
+  %message = call ptr @buffer_value(ptr %buffer)
+  store ptr %message, ptr @j_error
+  ret void
+}
+
+@text_cannot_iterate = private constant [21 x i8] c"Cannot iterate over \00"
+
 define ptr @j_negate(ptr %value) {
 entry:
   %tag = load i32, ptr %value
@@ -3110,6 +3129,17 @@ negate:
 literal:
   %first = load i8, ptr %lit
   %hasminus = icmp eq i8 %first, 45
+  %parts = call ptr @decimal_parts(ptr %lit)
+  %sign = load i32, ptr %parts
+  %zero = icmp eq i32 %sign, 0
+  br i1 %zero, label %literalzero, label %literalsign
+literalzero:
+  %vnp = getelementptr %V, ptr %v, i32 0, i32 2
+  store double 0.0, ptr %vnp
+  %unsignedzero = getelementptr i8, ptr %lit, i64 1
+  %zeroliteral = select i1 %hasminus, ptr %unsignedzero, ptr %lit
+  br label %storeliteral
+literalsign:
   br i1 %hasminus, label %positive, label %addminus
 positive:
   %positivebytes = getelementptr i8, ptr %lit, i64 1
@@ -3124,7 +3154,7 @@ addminus:
   call void @j_copy(ptr %tail, ptr %lit, i64 %copylen)
   br label %storeliteral
 storeliteral:
-  %newliteral = phi ptr [ %positivebytes, %positive ], [ %out, %addminus ]
+  %newliteral = phi ptr [ %positivebytes, %positive ], [ %out, %addminus ], [ %zeroliteral, %literalzero ]
   %newlp = getelementptr %V, ptr %v, i32 0, i32 6
   store ptr %newliteral, ptr %newlp
   br label %done

@@ -3,6 +3,8 @@ declare i64 @llvm.ctlz.i64(i64, i1)
 declare double @llvm.fabs.f64(double)
 declare double @llvm.sqrt.f64(double)
 declare double @m_atan(double)
+declare double @m_precise_atan(double)
+declare double @m_precise_atan2_finite(double, double)
 
 define i64 @m_parts(double %x, ptr %exponent) {
 entry:
@@ -225,14 +227,17 @@ diagonal:
   %quadrant = select i1 %xn, double 2.3561944901923448e+00, double 7.8539816339744828e-01
   br label %sign
 ordinary:
-  %ratio = fdiv double %y, %x
-  %absratio = call double @llvm.fabs.f64(double %ratio)
-  %acute = call double @m_atan(double %absratio)
-  %obtuse = fsub double 3.1415926535897931e+00, %acute
-  %angle = select i1 %xn, double %obtuse, double %acute
+  br i1 %yi, label %vertical, label %xinfcheck
+xinfcheck:
+  br i1 %xi, label %horizontal, label %finite
+horizontal:
+  %hangle = select i1 %xn, double 3.1415926535897931e+00, double 0.0
   br label %sign
+finite:
+  %angle = call double @m_precise_atan2_finite(double %y, double %x)
+  ret double %angle
 sign:
-  %positive = phi double [%quadrant, %diagonal], [%angle, %ordinary]
+  %positive = phi double [%quadrant, %diagonal], [%hangle, %horizontal]
   %negative = fneg double %positive
   %result = select i1 %yn, double %negative, double %positive
   ret double %result

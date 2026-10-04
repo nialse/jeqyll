@@ -136,7 +136,10 @@ error:
 convert:
   %integral = fptosi double %seconds to i64
   %integerfloat = sitofp i64 %integral to double
-  %fraction = fsub double %seconds, %integerfloat
+  %below = fcmp olt double %seconds, %integerfloat
+  %adjust = uitofp i1 %below to double
+  %floored = fsub double %integerfloat, %adjust
+  %fraction = fsub double %seconds, %floored
   %days = call i64 @t_floordiv(i64 %integral, i64 86400)
   %dayseconds = mul i64 %days, 86400
   %remaining = sub i64 %integral, %dayseconds
@@ -1726,11 +1729,11 @@ diagnostic:
   %errbuffer = call ptr @j_buffer_new()
   call void @j_buffer_append(ptr %errbuffer, ptr @t.dateprefix, i64 6)
   %inputdata = call ptr @b_data(ptr %input)
-  %inputlen = call i64 @b_len(ptr %input)
+  %inputlen = call i64 @j_strlen(ptr %inputdata)
   call void @j_buffer_append(ptr %errbuffer, ptr %inputdata, i64 %inputlen)
   call void @j_buffer_append(ptr %errbuffer, ptr @t.datebetween, i64 25)
   %formatdata = call ptr @b_data(ptr %format)
-  %formatlen = call i64 @b_len(ptr %format)
+  %formatlen = call i64 @j_strlen(ptr %formatdata)
   call void @j_buffer_append(ptr %errbuffer, ptr %formatdata, i64 %formatlen)
   call void @j_buffer_byte(ptr %errbuffer, i8 34)
   %message = call ptr @j_buffer_value(ptr %errbuffer)

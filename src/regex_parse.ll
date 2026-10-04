@@ -2,11 +2,16 @@
 %RS = type { i32, i32, i32, ptr, ptr }
 
 @rp_bad = private constant [31 x i8] c"Regex failure: invalid pattern\00"
+@rp_classend = private constant [43 x i8] c"Regex failure: premature end of char-class\00"
+@rp_escapeend = private constant [37 x i8] c"Regex failure: end pattern at escape\00"
+@rp_emptyclass = private constant [32 x i8] c"Regex failure: empty char-class\00"
+@rp_emptyrange = private constant [41 x i8] c"Regex failure: empty range in char class\00"
 @rp_propertybad = private constant [47 x i8] c"Regex failure: invalid character property name\00"
 
 declare ptr @j_alloc(i64)
 declare ptr @j_str(ptr, i64)
 declare void @j_fail(ptr)
+declare void @rx_fail(ptr)
 declare i32 @j_utf8_next(ptr, i64, ptr)
 declare i32 @rx_unicode_property(ptr, i64)
 declare i1 @rx_unicode_has(i32, i32)
@@ -74,8 +79,11 @@ entry:
     i32 116, label %tab i32 118, label %vt i32 120, label %hex
     i32 117, label %unicode i32 111, label %octalbrace i32 48, label %octal
     i32 99, label %control i32 67, label %controlminus i32 77, label %meta
-    i32 -1, label %invalid
+    i32 -1, label %escapeend
   ]
+escapeend:
+  call void @j_fail(ptr @rp_escapeend)
+  ret i32 -1
 bell:
   ret i32 7
 backspace:
@@ -345,7 +353,10 @@ rangeescape:
 rangedone:
   %hi = phi i32 [%upperchar, %rangeread], [%uppervalue, %rangeescape]
   %ordered = icmp ule i32 %lo, %hi
-  br i1 %ordered, label %makenode, label %invalid
+  br i1 %ordered, label %makenode, label %emptyrange
+emptyrange:
+  call void @rx_fail(ptr @rp_emptyrange)
+  br label %invalid
 single:
   br label %makenode
 makenode:
@@ -402,7 +413,7 @@ posixdone:
   %posixset = call ptr @rp_set(i32 1, i32 %finalproperty, i32 0, ptr null, ptr null)
   ret ptr %posixset
 invalid:
-  call void @j_fail(ptr @rp_bad)
+  call void @rx_fail(ptr @rp_bad)
   %empty = call ptr @rp_set(i32 0, i32 1, i32 0, ptr null, ptr null)
   ret ptr %empty
 }
@@ -427,6 +438,20 @@ loop:
   br i1 %eof, label %invalid, label %closing
 closing:
   %closechar = icmp eq i32 %c, 93
+  %firstclose = and i1 %closechar, %first
+  br i1 %firstclose, label %emptycheck, label %closecheck
+emptycheck:
+  %emptyip = getelementptr %RP, ptr %parser, i32 0, i32 2
+  %emptyi = load i64, ptr %emptyip
+  %emptynp = getelementptr %RP, ptr %parser, i32 0, i32 1
+  %emptyn = load i64, ptr %emptynp
+  %emptyafter = add i64 %emptyi, 1
+  %emptyend = icmp eq i64 %emptyafter, %emptyn
+  br i1 %emptyend, label %emptyclass, label %closecheck
+emptyclass:
+  call void @rx_fail(ptr @rp_emptyclass)
+  ret ptr null
+closecheck:
   %notfirst = xor i1 %first, true
   %close = and i1 %closechar, %notfirst
   br i1 %close, label %finish, label %andcheck
@@ -465,7 +490,7 @@ finish:
   %result = select i1 %negative, ptr %negated, ptr %positive
   ret ptr %result
 invalid:
-  call void @j_fail(ptr @rp_bad)
+  call void @rx_fail(ptr @rp_classend)
   ret ptr null
 }
 

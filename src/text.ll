@@ -5,6 +5,7 @@
 @t.space = private constant [2 x i8] c" \00"
 @t.quote = private constant [2 x i8] c"'\00"
 @t.shquote = private constant [5 x i8] c"'\5C''\00"
+@t.nulescape = private constant [3 x i8] c"\5C0\00"
 @t.htmlamp = private constant [6 x i8] c"&amp;\00"
 @t.htmllt = private constant [5 x i8] c"&lt;\00"
 @t.htmlgt = private constant [5 x i8] c"&gt;\00"
@@ -557,10 +558,12 @@ body:
   %p = getelementptr i8, ptr %s, i64 %i
   %c = load i8, ptr %p
   %dst = getelementptr i8, ptr %buf, i64 %pos
-  switch i8 %c, label %plain [i8 38, label %amp i8 60, label %lt i8 62, label %gt i8 34, label %quote i8 39, label %apos]
+  switch i8 %c, label %plain [i8 0, label %nul i8 38, label %amp i8 60, label %lt i8 62, label %gt i8 34, label %quote i8 39, label %apos]
 plain:
   store i8 %c, ptr %dst
   br label %advance
+nul:
+  br label %entity
 amp:
   br label %entity
 lt:
@@ -572,7 +575,7 @@ quote:
 apos:
   br label %entity
 entity:
-  %replacement = phi ptr [@t.htmlamp, %amp], [@t.htmllt, %lt], [@t.htmlgt, %gt], [@t.htmlquote, %quote], [@t.htmlapos, %apos]
+  %replacement = phi ptr [@t.nulescape, %nul], [@t.htmlamp, %amp], [@t.htmllt, %lt], [@t.htmlgt, %gt], [@t.htmlquote, %quote], [@t.htmlapos, %apos]
   %len = call i64 @j_strlen(ptr %replacement)
   call void @j_copy(ptr %dst, ptr %replacement, i64 %len)
   br label %advance
@@ -1084,7 +1087,13 @@ body:
   %c = load i8, ptr %src
   %dst = getelementptr i8, ptr %buf, i64 %pos
   %quote = icmp eq i8 %c, 39
-  br i1 %quote, label %escaped, label %literal
+  br i1 %quote, label %escaped, label %nulcheck
+nulcheck:
+  %nul = icmp eq i8 %c, 0
+  br i1 %nul, label %nulescaped, label %literal
+nulescaped:
+  call void @j_copy(ptr %dst, ptr @t.nulescape, i64 2)
+  br label %advance
 escaped:
   call void @j_copy(ptr %dst, ptr @t.shquote, i64 4)
   br label %advance
@@ -1092,7 +1101,7 @@ literal:
   store i8 %c, ptr %dst
   br label %advance
 advance:
-  %written = phi i64 [4, %escaped], [1, %literal]
+  %written = phi i64 [4, %escaped], [2, %nulescaped], [1, %literal]
   %pn = add i64 %pos, %written
   %next = add i64 %i, 1
   br label %loop

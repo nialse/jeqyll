@@ -19,7 +19,7 @@
 @b.Value = private constant [6 x i8] c"Value\00"
 @b.name = private constant [5 x i8] c"name\00"
 @b.Name = private constant [5 x i8] c"Name\00"
-@b.errlen = private constant [22 x i8] c"has no length defined\00"
+@b.errlen = private constant [14 x i8] c"has no length\00"
 @b.errutf8 = private constant [36 x i8] c"only strings have UTF-8 byte length\00"
 @b.errnumber = private constant [29 x i8] c"cannot be parsed as a number\00"
 @b.errboolean = private constant [30 x i8] c"cannot be parsed as a boolean\00"
@@ -32,6 +32,7 @@
 @b.errlimit = private constant [37 x i8] c"limit doesn't support negative count\00"
 @b.errpaths = private constant [36 x i8] c"Paths must be specified as an array\00"
 @b.errpathtoo = private constant [14 x i8] c"Path too deep\00"
+@b.errnegativeindex = private constant [35 x i8] c"Out of bounds negative array index\00"
 @b.errcontainsdeep = private constant [27 x i8] c"Containment check too deep\00"
 @b.errsearch = private constant [24 x i8] c"cannot be searched from\00"
 @b.errupdatearray = private constant [44 x i8] c"Cannot update field at array index of array\00"
@@ -42,7 +43,7 @@
 @b.errhasprefix = private constant [22 x i8] c"Cannot check whether \00"
 @b.errhasmiddle = private constant [8 x i8] c" has a \00"
 @b.errhassuffix = private constant [5 x i8] c" key\00"
-@b.errcontain = private constant [15 x i8] c"cannot contain\00"
+@b.errcontain = private constant [46 x i8] c"cannot have their containment checked\00\00\00\00\00\00\00\00\00"
 
 declare ptr @j_alloc(i64)
 declare ptr @j_null()
@@ -90,6 +91,7 @@ declare ptr @j_time_names()
 declare ptr @j_regex_names()
 declare ptr @j_cli_names()
 declare ptr @b_delete_many(ptr, ptr)
+declare void @ev_itererror(ptr)
 
 define i32 @b_tag(ptr %v) {
 entry:
@@ -666,7 +668,9 @@ put:
   %x = phi ptr [%v1, %lower], [%v2, %upper]
   call void @j_put(ptr %r, ptr %k, ptr %x)
   %next = add i64 %i, 1
-  br label %loop
+  %error = load ptr, ptr @j_error
+  %failed = icmp ne ptr %error, null
+  br i1 %failed, label %done, label %loop
 done:
   ret ptr %r
 }
@@ -762,7 +766,10 @@ array:
   %adjust = add i64 %idx0, %len
   %idx = select i1 %neg, i64 %adjust, i64 %idx0
   %valid = icmp sge i64 %idx, 0
-  br i1 %valid, label %extend, label %return
+  br i1 %valid, label %extend, label %negativeerror
+negativeerror:
+  call void @j_fail(ptr @b.errnegativeindex)
+  br label %return
 extend:
   %i = phi i64 [%len, %array], [%inc, %pad]
   %need = icmp sle i64 %i, %idx
@@ -1018,7 +1025,8 @@ lenzero:
   br label %lennum
 lenabs:
   %f = call double @b_number(ptr %input)
-  %isnegative = fcmp olt double %f, 0.000000e+00
+  %fbits = bitcast double %f to i64
+  %isnegative = icmp slt i64 %fbits, 0
   br i1 %isnegative, label %lennegative, label %identity
 lennegative:
   %abs = call ptr @j_negate(ptr %input)
@@ -1366,11 +1374,18 @@ newarr:
   br label %start
 start:
   %out = phi ptr [%o, %newobj], [%a, %newarr]
+  %arr = icmp eq i32 %tag, 5
+  %iterable = or i1 %arr, %obj
+  br i1 %iterable, label %keybegin, label %invalid
+invalid:
+  call void @ev_itererror(ptr %input)
+  ret ptr %out
+keybegin:
   %keys = call ptr @b_keys(ptr %input, i1 false)
   %n = call i64 @b_len(ptr %keys)
   br label %loop
 loop:
-  %i = phi i64 [0, %start], [%next, %advance]
+  %i = phi i64 [0, %keybegin], [%next, %advance]
   %more = icmp slt i64 %i, %n
   br i1 %more, label %body, label %done
 body:
@@ -2016,34 +2031,74 @@ done:
 define ptr @b_transpose(ptr %input) {
 entry:
   %out = call ptr @j_array()
-  %n = call i64 @b_len(ptr %input)
+  %tag = load i32, ptr %input
+  %array = icmp eq i32 %tag, 5
+  %object = icmp eq i32 %tag, 6
+  %container = or i1 %array, %object
+  br i1 %container, label %start, label %badinput
+badinput:
+  call void @ev_itererror(ptr %input)
+  ret ptr %out
+start:
+  %keys = call ptr @b_keys(ptr %input, i1 false)
+  %n = call i64 @b_len(ptr %keys)
   br label %maxloop
 maxloop:
-  %i = phi i64 [0, %entry], [%next, %maxbody]
-  %max = phi i64 [0, %entry], [%newmax, %maxbody]
+  %i = phi i64 [0, %start], [%next, %maxvalue]
+  %max = phi double [0.0, %start], [%newmax, %maxvalue]
   %more = icmp slt i64 %i, %n
   br i1 %more, label %maxbody, label %outer
 maxbody:
-  %v = call ptr @j_at(ptr %input, i64 %i)
+  %key = call ptr @j_at(ptr %keys, i64 %i)
+  %v = call ptr @j_get(ptr %input, ptr %key)
+  %vt = load i32, ptr %v
+  switch i32 %vt, label %badlength [i32 0, label %nulllength i32 3, label %numlength i32 4, label %strlength i32 5, label %containerlength i32 6, label %containerlength]
+badlength:
+  call void @b_type_error(ptr %v, ptr @b.errlen)
+  ret ptr %out
+nulllength:
+  br label %maxvalue
+numlength:
+  %number = call double @b_number(ptr %v)
+  %abs = call double @llvm.fabs.f64(double %number)
+  br label %maxvalue
+strlength:
+  %bytes = call i64 @b_len(ptr %v)
+  %data = call ptr @b_data(ptr %v)
+  %chars = call i64 @b_utf8_length(ptr %data, i64 %bytes)
+  %charlen = uitofp i64 %chars to double
+  br label %maxvalue
+containerlength:
   %len = call i64 @b_len(ptr %v)
-  %bigger = icmp sgt i64 %len, %max
-  %newmax = select i1 %bigger, i64 %len, i64 %max
+  %containerlen = uitofp i64 %len to double
+  br label %maxvalue
+maxvalue:
+  %length = phi double [0.0, %nulllength], [%abs, %numlength], [%charlen, %strlength], [%containerlen, %containerlength]
+  %bigger = fcmp ogt double %length, %max
+  %newmax = select i1 %bigger, double %length, double %max
   %next = add i64 %i, 1
   br label %maxloop
 outer:
   %col = phi i64 [0, %maxloop], [%colnext, %rowdone]
-  %colmore = icmp slt i64 %col, %max
+  %coldouble = uitofp i64 %col to double
+  %colmore = fcmp olt double %coldouble, %max
   br i1 %colmore, label %rowstart, label %done
 rowstart:
   %row = call ptr @j_array()
+  %colkey = call ptr @j_num(double %coldouble)
   br label %inner
 inner:
-  %j = phi i64 [0, %rowstart], [%jnext, %body]
+  %j = phi i64 [0, %rowstart], [%jnext, %append]
   %jmore = icmp slt i64 %j, %n
   br i1 %jmore, label %body, label %rowdone
 body:
-  %srcrow = call ptr @j_at(ptr %input, i64 %j)
-  %value = call ptr @j_at(ptr %srcrow, i64 %col)
+  %rowkey = call ptr @j_at(ptr %keys, i64 %j)
+  %srcrow = call ptr @j_get(ptr %input, ptr %rowkey)
+  %value = call ptr @j_get(ptr %srcrow, ptr %colkey)
+  %error = load ptr, ptr @j_error
+  %failed = icmp ne ptr %error, null
+  br i1 %failed, label %done, label %append
+append:
   call void @j_push(ptr %row, ptr %value)
   %jnext = add i64 %j, 1
   br label %inner

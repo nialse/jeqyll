@@ -7,6 +7,13 @@
 @j_error = external global ptr
 @rx_names = private constant [47 x i8] c"match\00test\00capture\00scan\00sub\00gsub\00splits\00split\00\00"
 @rx_bad = private constant [31 x i8] c"Regex failure: invalid pattern\00"
+@rx_groupend = private constant [36 x i8] c"Regex failure: end pattern in group\00"
+@rx_groupname = private constant [36 x i8] c"Regex failure: invalid group name <\00"
+@rx_groupnameend = private constant [2 x i8] c">\00"
+@rx_unmatched = private constant [54 x i8] c"Regex failure: end pattern with unmatched parenthesis\00"
+@rx_closeparen = private constant [43 x i8] c"Regex failure: unmatched close parenthesis\00"
+@rx_repeatmissing = private constant [58 x i8] c"Regex failure: target of repeat operator is not specified\00"
+@rx_repeatrange = private constant [59 x i8] c"Regex failure: upper is smaller than lower in repeat range\00"
 @rx_unsupported = private constant [46 x i8] c"Regex failure: unsupported regular expression\00"
 @rx_flagsbad = private constant [38 x i8] c"Regex failure: invalid modifier flags\00"
 @rx_stringbad = private constant [36 x i8] c"Regular expressions require strings\00"
@@ -22,6 +29,12 @@
 @rx_zero = private constant [2 x i8] c"0\00"
 
 declare ptr @j_alloc(i64)
+declare void @j_copy(ptr, ptr, i64)
+declare i64 @rx_capture_bytes(ptr)
+declare i64 @rx_max_width(ptr, i64, i32)
+declare ptr @rx_choice(ptr, ptr, i64, ptr, ptr)
+declare void @rx_restore_choice(ptr, ptr, ptr)
+declare i1 @rx_guard(ptr, ptr, i64)
 declare ptr @j_null()
 declare ptr @j_bool(i1)
 declare ptr @j_num(double)
@@ -58,17 +71,16 @@ declare ptr @rx_parse_named(ptr)
 declare ptr @rx_parse_until(ptr, i32)
 declare i1 @rx_property_test(i32, i32)
 declare i1 @rx_set_test(ptr, i32, i32)
-declare i64 @rx_split(ptr, ptr, i64, ptr, i64)
 declare i64 @rx_assert(ptr, ptr, i64, ptr, i64)
 declare i32 @rx_reference_id(ptr, i32, ptr, ptr)
-declare i64 @rx_literal_fold(ptr, ptr, i64, ptr, i64)
+declare {ptr, i64} @rx_literal_fold(ptr, ptr, i64)
 declare i64 @rx_backref_fold(ptr, i64, i64, i64)
 declare i64 @rx_grapheme_end(ptr, i64, i64)
 declare i1 @rx_grapheme_boundary(ptr, i64, i64)
-declare i64 @rx_call(ptr, ptr, i64, ptr, i64)
-declare i64 @rx_return(ptr, i64, ptr, i64)
+declare ptr @rx_call(ptr, ptr, i64)
+declare ptr @rx_return(ptr)
 declare i64 @rx_absent(ptr, ptr, i64, ptr, i64)
-declare i64 @rx_conditional(ptr, ptr, i64, ptr, i64)
+declare {ptr, i64} @rx_conditional(ptr, ptr, i64, ptr, i64)
 declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
 
 define ptr @j_regex_names() {
@@ -103,6 +115,29 @@ define internal ptr @rx_node(i32 %op, i32 %value, ptr %a, ptr %b, ptr %data) {
   %dp = getelementptr %RX, ptr %n, i32 0, i32 6
   store ptr %data, ptr %dp
   ret ptr %n
+}
+
+define internal i1 @rx_search_bound_safe(ptr %ast) {
+entry:
+  %empty = icmp eq ptr %ast, null
+  br i1 %empty, label %yes, label %read
+read:
+  %op = load i32, ptr %ast
+  switch i32 %op, label %children [i32 15, label %no i32 16, label %no i32 28, label %no]
+children:
+  %ap = getelementptr %RX, ptr %ast, i32 0, i32 4
+  %bp = getelementptr %RX, ptr %ast, i32 0, i32 5
+  %a = load ptr, ptr %ap
+  %b = load ptr, ptr %bp
+  %left = call i1 @rx_search_bound_safe(ptr %a)
+  br i1 %left, label %right, label %no
+right:
+  %result = call i1 @rx_search_bound_safe(ptr %b)
+  ret i1 %result
+yes:
+  ret i1 true
+no:
+  ret i1 false
 }
 
 define internal i32 @rx_peek(ptr %p) {
@@ -202,8 +237,11 @@ entry:
   switch i32 %c, label %literal [
     i32 40, label %group i32 91, label %class i32 46, label %dot
     i32 94, label %start i32 36, label %end i32 92, label %escape
-    i32 42, label %invalid i32 43, label %invalid i32 63, label %invalid
+    i32 42, label %repeatmissing i32 43, label %repeatmissing i32 63, label %repeatmissing
   ]
+repeatmissing:
+  call void @rx_fail(ptr @rx_repeatmissing)
+  br label %invalid
 literal:
   %char = call i32 @rx_take(ptr %p)
   %lit = call ptr @rx_node(i32 1, i32 %char, ptr null, ptr null, ptr null)
@@ -353,10 +391,14 @@ groupmod:
   %mod = call i32 @rx_peek(ptr %p)
   call void @rx_advance(ptr %p)
   switch i32 %mod, label %unsupported [ i32 58, label %noncapture i32 60, label %groupangle i32 39, label %namedquote i32 61, label %ahead i32 33, label %notahead i32 62, label %atomic i32 35, label %comment
+    i32 -1, label %groupend
     i32 105, label %options i32 109, label %options i32 115, label %options i32 120, label %options i32 45, label %minusgroup
     i32 38, label %callnamed i32 82, label %callroot i32 40, label %conditional
     i32 126, label %absent
     i32 48, label %callnumber i32 49, label %callnumber i32 50, label %callnumber i32 51, label %callnumber i32 52, label %callnumber i32 53, label %callnumber i32 54, label %callnumber i32 55, label %callnumber i32 56, label %callnumber i32 57, label %callnumber ]
+groupend:
+  call void @rx_fail(ptr @rx_groupend)
+  br label %invalid
 minusgroup:
   %minusc = call i32 @rx_peek(ptr %p)
   %minusd = sub i32 %minusc, 48
@@ -512,7 +554,20 @@ nameloop:
   br i1 %ne, label %nameend, label %namenext
 namenext:
   %nmissing = icmp slt i32 %nc, 0
-  br i1 %nmissing, label %invalid, label %nameadvance
+  br i1 %nmissing, label %nameinvalid, label %nameadvance
+nameinvalid:
+  %badnameend = load i64, ptr %nip
+  %badnamedata = load ptr, ptr %p
+  %badnameptr = getelementptr i8, ptr %badnamedata, i64 %ns
+  %badnamelen = sub i64 %badnameend, %ns
+  %badname = call ptr @j_str(ptr %badnameptr, i64 %badnamelen)
+  %badnameprefix = call ptr @j_cstr(ptr @rx_groupname)
+  %badnamesuffix = call ptr @j_cstr(ptr @rx_groupnameend)
+  %badnamestart = call ptr @j_binary(i32 0, ptr %badnameprefix, ptr %badname)
+  %badnamemessage = call ptr @j_binary(i32 0, ptr %badnamestart, ptr %badnamesuffix)
+  %badmessageptr = call ptr @b_data(ptr %badnamemessage)
+  call void @rx_fail(ptr %badmessageptr)
+  br label %invalid
 nameadvance:
   call void @rx_advance(ptr %p)
   br label %nameloop
@@ -568,7 +623,10 @@ groupbody:
   %body = call ptr @rx_expr(ptr %p)
   %closer = call i32 @rx_peek(ptr %p)
   %closed = icmp eq i32 %closer, 41
-  br i1 %closed, label %groupdone, label %invalid
+  br i1 %closed, label %groupdone, label %unmatchedgroup
+unmatchedgroup:
+  call void @rx_fail(ptr @rx_unmatched)
+  br label %invalid
 groupdone:
   call void @rx_advance(ptr %p)
   store i32 %groupflags, ptr %groupflagp
@@ -584,7 +642,7 @@ unsupported:
   %un = call ptr @rx_node(i32 0, i32 0, ptr null, ptr null, ptr null)
   ret ptr %un
 invalid:
-  call void @j_fail(ptr @rx_bad)
+  call void @rx_fail(ptr @rx_bad)
   %badn = call ptr @rx_node(i32 0, i32 0, ptr null, ptr null, ptr null)
   ret ptr %badn
 }
@@ -641,7 +699,7 @@ done:
   store i32 %old, ptr %oldp
   ret ptr %node
 invalid:
-  call void @j_fail(ptr @rx_bad)
+  call void @rx_fail(ptr @rx_bad)
   %empty = call ptr @rx_node(i32 0, i32 0, ptr null, ptr null, ptr null)
   ret ptr %empty
 }
@@ -728,7 +786,7 @@ append:
   %joined = call ptr @rx_node(i32 4, i32 0, ptr %seq, ptr %item, ptr null)
   br label %loop
 invalid:
-  call void @j_fail(ptr @rx_bad)
+  call void @rx_fail(ptr @rx_bad)
   br label %end
 end:
   ret ptr %seq
@@ -965,13 +1023,38 @@ miss:
   ret i1 %negated
 }
 
-define i64 @rx_run(ptr %node, ptr %ctx, i64 %pos, ptr %captures, i64 %depth) {
+define i64 @rx_run(ptr %initialnode, ptr %ctx, i64 %initialpos, ptr %captures, i64 %depth) {
 entry:
-  %accept = icmp eq ptr %node, null
-  br i1 %accept, label %success, label %read
-read:
   %over = icmp ugt i64 %depth, 8192
-  br i1 %over, label %resource, label %fields
+  br i1 %over, label %resource, label %initialize
+initialize:
+  %cursor = alloca ptr
+  %position = alloca i64
+  %choices = alloca ptr
+  %bestendp = alloca i64
+  %bestkeepp = alloca i64
+  %originalctx = alloca %RC
+  call void @j_copy(ptr %originalctx, ptr %ctx, i64 112)
+  %capturebytes = call i64 @rx_capture_bytes(ptr %ctx)
+  %originalcaps = call ptr @j_alloc(i64 %capturebytes)
+  %bestcaps = call ptr @j_alloc(i64 %capturebytes)
+  call void @j_copy(ptr %originalcaps, ptr %captures, i64 %capturebytes)
+  %initialflagp = getelementptr %RC, ptr %ctx, i32 0, i32 4
+  %initialflags = load i32, ptr %initialflagp
+  %longestbit = and i32 %initialflags, 64
+  %longest = icmp ne i32 %longestbit, 0
+  store ptr %initialnode, ptr %cursor
+  store i64 %initialpos, ptr %position
+  store ptr null, ptr %choices
+  store i64 -1, ptr %bestendp
+  store i64 -1, ptr %bestkeepp
+  %nd = add i64 %depth, 1
+  br label %dispatch
+dispatch:
+  %node = load ptr, ptr %cursor
+  %pos = load i64, ptr %position
+  %accept = icmp eq ptr %node, null
+  br i1 %accept, label %success, label %fields
 resource:
   call void @j_fail(ptr @rx_limit)
   ret i64 -1
@@ -993,7 +1076,6 @@ fields:
   %limit = load i64, ptr %limitp
   %fp = getelementptr %RC, ptr %ctx, i32 0, i32 4
   %flags = load i32, ptr %fp
-  %nd = add i64 %depth, 1
   switch i32 %op, label %consuming [
     i32 0, label %success i32 4, label %split i32 5, label %save i32 6, label %save
     i32 8, label %start i32 9, label %end i32 10, label %boundary
@@ -1017,8 +1099,15 @@ literal:
   %insensitive = icmp ne i32 %icbit, 0
   br i1 %insensitive, label %literalfold, label %literalexact
 literalfold:
-  %literalresult = call i64 @rx_literal_fold(ptr %node, ptr %ctx, i64 %pos, ptr %captures, i64 %nd)
-  ret i64 %literalresult
+  %literalresult = call {ptr, i64} @rx_literal_fold(ptr %node, ptr %ctx, i64 %pos)
+  %literaltail = extractvalue {ptr, i64} %literalresult, 0
+  %literalend = extractvalue {ptr, i64} %literalresult, 1
+  %literalfound = icmp sge i64 %literalend, 0
+  br i1 %literalfound, label %literaladvance, label %fail
+literaladvance:
+  store ptr %literaltail, ptr %cursor
+  store i64 %literalend, ptr %position
+  br label %dispatch
 literalexact:
   %same = icmp eq i32 %c, %value
   br i1 %same, label %consume, label %fail
@@ -1027,8 +1116,8 @@ grapheme:
   %graphemewithin = icmp ule i64 %graphemeend, %limit
   br i1 %graphemewithin, label %graphemedone, label %fail
 graphemedone:
-  %graphemeresult = call i64 @rx_run(ptr %a, ptr %ctx, i64 %graphemeend, ptr %captures, i64 %nd)
-  ret i64 %graphemeresult
+  store i64 %graphemeend, ptr %position
+  br label %continue
 graphemeboundary:
   %gbound = call i1 @rx_grapheme_boundary(ptr %cps, i64 %n, i64 %pos)
   %gnegative = icmp eq i32 %value, 89
@@ -1067,8 +1156,8 @@ newlinepair:
   br i1 %crlf, label %newlineboth, label %consume
 newlineboth:
   %crend = add i64 %pos, 2
-  %crresult = call i64 @rx_run(ptr %a, ptr %ctx, i64 %crend, ptr %captures, i64 %nd)
-  ret i64 %crresult
+  store i64 %crend, ptr %position
+  br label %continue
 newlinetest:
   %nlstart = icmp uge i32 %c, 10
   %nlend = icmp ule i32 %c, 13
@@ -1082,11 +1171,16 @@ newlinetest:
   br i1 %newlineok, label %consume, label %fail
 consume:
   %nextpos = add i64 %pos, 1
-  %cres = call i64 @rx_run(ptr %a, ptr %ctx, i64 %nextpos, ptr %captures, i64 %nd)
-  ret i64 %cres
+  store i64 %nextpos, ptr %position
+  br label %continue
 split:
-  %splitresult = call i64 @rx_split(ptr %node, ptr %ctx, i64 %pos, ptr %captures, i64 %nd)
-  ret i64 %splitresult
+  %splitallowed = call i1 @rx_guard(ptr %node, ptr %ctx, i64 %pos)
+  br i1 %splitallowed, label %choice, label %fail
+choice:
+  %previouschoice = load ptr, ptr %choices
+  %choiceframe = call ptr @rx_choice(ptr %previouschoice, ptr %b, i64 %pos, ptr %ctx, ptr %captures)
+  store ptr %choiceframe, ptr %choices
+  br label %continue
 save:
   %capindex = mul i32 %value, 2
   %last = icmp eq i32 %op, 6
@@ -1094,16 +1188,8 @@ save:
   %capi = add i32 %capindex, %lastbit
   %capi64 = zext i32 %capi to i64
   %cap = getelementptr i64, ptr %captures, i64 %capi64
-  %old = load i64, ptr %cap
   store i64 %pos, ptr %cap
-  %savedres = call i64 @rx_run(ptr %a, ptr %ctx, i64 %pos, ptr %captures, i64 %nd)
-  %savedok = icmp sge i64 %savedres, 0
-  br i1 %savedok, label %savedone, label %restore
-restore:
-  store i64 %old, ptr %cap
-  ret i64 -1
-savedone:
-  ret i64 %savedres
+  br label %continue
 start:
   %atstart = icmp eq i64 %pos, 0
   br i1 %atstart, label %continue, label %startline
@@ -1166,12 +1252,14 @@ boundcheck:
   br i1 %boundok, label %continue, label %fail
 lookahead:
   %assertion = call i64 @rx_assert(ptr %node, ptr %ctx, i64 %pos, ptr %captures, i64 %nd)
-  ret i64 %assertion
+  %asserted = icmp sge i64 %assertion, 0
+  br i1 %asserted, label %assertionadvance, label %fail
+assertionadvance:
+  store i64 %assertion, ptr %position
+  br label %continue
 options:
   store i32 %value, ptr %fp
-  %optionresult = call i64 @rx_run(ptr %a, ptr %ctx, i64 %pos, ptr %captures, i64 %nd)
-  store i32 %flags, ptr %fp
-  ret i64 %optionresult
+  br label %continue
 searchstart:
   %originp = getelementptr %RC, ptr %ctx, i32 0, i32 7
   %origin = load i64, ptr %originp
@@ -1179,14 +1267,8 @@ searchstart:
   br i1 %atsearch, label %continue, label %fail
 keep:
   %keepp = getelementptr %RC, ptr %ctx, i32 0, i32 8
-  %oldkeep = load i64, ptr %keepp
   store i64 %pos, ptr %keepp
-  %keepresult = call i64 @rx_run(ptr %a, ptr %ctx, i64 %pos, ptr %captures, i64 %nd)
-  %kept = icmp sge i64 %keepresult, 0
-  %currentkeep = load i64, ptr %keepp
-  %finalkeep = select i1 %kept, i64 %currentkeep, i64 %oldkeep
-  store i64 %finalkeep, ptr %keepp
-  ret i64 %keepresult
+  br label %continue
 assertend:
   %targetp = getelementptr %RC, ptr %ctx, i32 0, i32 9
   %target = load i64, ptr %targetp
@@ -1199,14 +1281,19 @@ reference:
   %refvalid = icmp ult i32 %refid, %cc
   br i1 %refvalid, label %refvalue, label %fail
 subcall:
-  %subresult = call i64 @rx_call(ptr %node, ptr %ctx, i64 %pos, ptr %captures, i64 %nd)
-  ret i64 %subresult
+  %subbody = call ptr @rx_call(ptr %node, ptr %ctx, i64 %pos)
+  %subvalid = icmp ne ptr %subbody, null
+  br i1 %subvalid, label %subenter, label %fail
+subenter:
+  store ptr %subbody, ptr %cursor
+  br label %dispatch
 absent:
   %absentresult = call i64 @rx_absent(ptr %node, ptr %ctx, i64 %pos, ptr %captures, i64 %nd)
-  ret i64 %absentresult
+  br label %helperresult
 return:
-  %returnresult = call i64 @rx_return(ptr %ctx, i64 %pos, ptr %captures, i64 %nd)
-  ret i64 %returnresult
+  %returnnode = call ptr @rx_return(ptr %ctx)
+  store ptr %returnnode, ptr %cursor
+  br label %dispatch
 conditional:
   %conditionid = call i32 @rx_reference_id(ptr %data, i32 %value, ptr %ctx, ptr %captures)
   %conditionccp = getelementptr %RC, ptr %ctx, i32 0, i32 5
@@ -1214,8 +1301,16 @@ conditional:
   %conditionvalid = icmp ult i32 %conditionid, %conditioncount
   br i1 %conditionvalid, label %conditioncapture, label %conditionfalse
 conditionalexpression:
-  %conditionresult = call i64 @rx_conditional(ptr %node, ptr %ctx, i64 %pos, ptr %captures, i64 %nd)
-  ret i64 %conditionresult
+  %conditionresult = call {ptr, i64} @rx_conditional(ptr %node, ptr %ctx, i64 %pos, ptr %captures, i64 %nd)
+  %conditionnode = extractvalue {ptr, i64} %conditionresult, 0
+  %conditionpos = extractvalue {ptr, i64} %conditionresult, 1
+  store ptr %conditionnode, ptr %cursor
+  store i64 %conditionpos, ptr %position
+  br label %dispatch
+helperresult:
+  %helperend = phi i64 [%absentresult, %absent]
+  %helperfound = icmp sge i64 %helperend, 0
+  br i1 %helperfound, label %accepted, label %fail
 conditioncapture:
   %conditioni = sext i32 %conditionid to i64
   %conditionslot = mul i64 %conditioni, 2
@@ -1224,11 +1319,10 @@ conditioncapture:
   %conditiontrue = icmp sge i64 %conditionstart, 0
   br i1 %conditiontrue, label %conditionyes, label %conditionfalse
 conditionyes:
-  %yesresult = call i64 @rx_run(ptr %a, ptr %ctx, i64 %pos, ptr %captures, i64 %nd)
-  ret i64 %yesresult
+  br label %continue
 conditionfalse:
-  %noresult = call i64 @rx_run(ptr %b, ptr %ctx, i64 %pos, ptr %captures, i64 %nd)
-  ret i64 %noresult
+  store ptr %b, ptr %cursor
+  br label %dispatch
 refvalue:
   %refi = mul i32 %refid, 2
   %refi64 = zext i32 %refi to i64
@@ -1254,8 +1348,8 @@ reffold:
   %reffoldok = icmp sge i64 %reffoldend, 0
   br i1 %reffoldok, label %reffolddone, label %fail
 reffolddone:
-  %reffoldresult = call i64 @rx_run(ptr %a, ptr %ctx, i64 %reffoldend, ptr %captures, i64 %nd)
-  ret i64 %reffoldresult
+  store i64 %reffoldend, ptr %position
+  br label %continue
 refloop:
   %r = phi i64 [ 0, %refmode ], [ %rn, %refnext ]
   %rend = icmp uge i64 %r, %reflen
@@ -1275,11 +1369,11 @@ refnext:
   %rn = add i64 %r, 1
   br label %refloop
 refdone:
-  %refresult = call i64 @rx_run(ptr %a, ptr %ctx, i64 %refafter, ptr %captures, i64 %nd)
-  ret i64 %refresult
+  store i64 %refafter, ptr %position
+  br label %continue
 continue:
-  %result = call i64 @rx_run(ptr %a, ptr %ctx, i64 %pos, ptr %captures, i64 %nd)
-  ret i64 %result
+  store ptr %a, ptr %cursor
+  br label %dispatch
 success:
   %successfp = getelementptr %RC, ptr %ctx, i32 0, i32 4
   %successflags = load i32, ptr %successfp
@@ -1291,9 +1385,59 @@ success:
   %denyempty = and i1 %notempty, %isempty
   br i1 %denyempty, label %fail, label %accepted
 accepted:
-  ret i64 %pos
+  %matchend = phi i64 [%pos, %success], [%helperend, %helperresult]
+  %previousbest = load i64, ptr %bestendp
+  %better = icmp sgt i64 %matchend, %previousbest
+  br i1 %better, label %savebest, label %nextmatch
+savebest:
+  store i64 %matchend, ptr %bestendp
+  %bestkp = getelementptr %RC, ptr %ctx, i32 0, i32 8
+  %bestkeep = load i64, ptr %bestkp
+  store i64 %bestkeep, ptr %bestkeepp
+  call void @j_copy(ptr %bestcaps, ptr %captures, i64 %capturebytes)
+  br label %nextmatch
+nextmatch:
+  %endlimitp = getelementptr %RC, ptr %ctx, i32 0, i32 3
+  %endlimit = load i64, ptr %endlimitp
+  %room = icmp ult i64 %matchend, %endlimit
+  %searchmore = and i1 %longest, %room
+  br i1 %searchmore, label %fail, label %finish
 fail:
-  ret i64 -1
+  %pendingerror = load ptr, ptr @j_error
+  %errored = icmp ne ptr %pendingerror, null
+  br i1 %errored, label %abort, label %backtrack
+backtrack:
+  %retryframe = load ptr, ptr %choices
+  %haschoice = icmp ne ptr %retryframe, null
+  br i1 %haschoice, label %retry, label %finish
+retry:
+  %remaining = load ptr, ptr %retryframe
+  %retrynodep = getelementptr ptr, ptr %retryframe, i64 1
+  %retryposp = getelementptr i64, ptr %retryframe, i64 2
+  %retrynode = load ptr, ptr %retrynodep
+  %retrypos = load i64, ptr %retryposp
+  call void @rx_restore_choice(ptr %retryframe, ptr %ctx, ptr %captures)
+  store ptr %remaining, ptr %choices
+  store ptr %retrynode, ptr %cursor
+  store i64 %retrypos, ptr %position
+  br label %dispatch
+abort:
+  store i64 -1, ptr %bestendp
+  br label %finish
+finish:
+  %finalend = load i64, ptr %bestendp
+  %matched = icmp sge i64 %finalend, 0
+  %finalcaps = select i1 %matched, ptr %bestcaps, ptr %originalcaps
+  call void @j_copy(ptr %ctx, ptr %originalctx, i64 112)
+  call void @j_copy(ptr %captures, ptr %finalcaps, i64 %capturebytes)
+  br i1 %matched, label %finishkeep, label %done
+finishkeep:
+  %finalkeep = load i64, ptr %bestkeepp
+  %finalkeepp = getelementptr %RC, ptr %ctx, i32 0, i32 8
+  store i64 %finalkeep, ptr %finalkeepp
+  br label %done
+done:
+  ret i64 %finalend
 }
 
 define internal i32 @rx_flags(ptr %value) {
@@ -1489,7 +1633,7 @@ repeat:
   %invalid = and i1 %bounded, %reversed
   br i1 %invalid, label %badrepeat, label %one
 badrepeat:
-  call void @j_fail(ptr @rx_bad)
+  call void @rx_fail(ptr @rx_repeatrange)
   br label %done
 three:
   call void @rx_validate(ptr %data, ptr %ctx)
@@ -1559,7 +1703,9 @@ compile:
   %tailend = icmp slt i32 %tail, 0
   br i1 %tailend, label %compiled, label %badpattern
 badpattern:
-  call void @j_fail(ptr @rx_bad)
+  %closeparenthesis = icmp eq i32 %tail, 41
+  %tailreason = select i1 %closeparenthesis, ptr @rx_closeparen, ptr @rx_bad
+  call void @rx_fail(ptr %tailreason)
   ret ptr %out
 compiled:
   %err = load ptr, ptr @j_error
@@ -1577,6 +1723,7 @@ ready:
   %compilevalid = icmp eq ptr %validationerror, null
   br i1 %compilevalid, label %programready, label %done
 programready:
+  %boundsafe = call i1 @rx_search_bound_safe(ptr %tree)
   %graph = call ptr @rx_compile(ptr %tree, ptr null)
   call void @rx_compile_calls(ptr %tree, ptr %ctx)
   %count64 = zext i32 %count to i64
@@ -1589,6 +1736,7 @@ programready:
   %np = getelementptr %RC, ptr %ctx, i32 0, i32 3
   %n = load i64, ptr %np
   %originp = getelementptr %RC, ptr %ctx, i32 0, i32 7
+  %maximumwidth = call i64 @rx_max_width(ptr %tree, i64 %n, i32 %flags)
   %keepp = getelementptr %RC, ptr %ctx, i32 0, i32 8
   %visitedp = getelementptr %RC, ptr %ctx, i32 0, i32 10
   %graphp = getelementptr %RC, ptr %ctx, i32 0, i32 11
@@ -1647,7 +1795,17 @@ savebest:
   br label %advance
 advance:
   %nextpos = add i64 %pos, 1
-  br label %search
+  %boundend = load i64, ptr %bestendp
+  %boundstart = load i64, ptr %beststartp
+  %boundlength = sub i64 %boundend, %boundstart
+  %remaininglength = sub i64 %n, %nextpos
+  %hasbound = icmp sge i64 %boundend, 0
+  %cannotimprove = icmp sle i64 %remaininglength, %boundlength
+  %maximumfound = icmp uge i64 %boundlength, %maximumwidth
+  %completebound = or i1 %cannotimprove, %maximumfound
+  %bounded = and i1 %hasbound, %completebound
+  %safeend = and i1 %bounded, %boundsafe
+  br i1 %safeend, label %searchdone, label %search
 searchdone:
   %winningstart = load i64, ptr %beststartp
   %winningend = load i64, ptr %bestendp
@@ -1673,6 +1831,18 @@ matchednext:
   br label %segment
 done:
   ret ptr %out
+}
+
+define void @rx_fail(ptr %message) {
+entry:
+  %old = load ptr, ptr @j_error
+  %clear = icmp eq ptr %old, null
+  br i1 %clear, label %raise, label %done
+raise:
+  call void @j_fail(ptr %message)
+  br label %done
+done:
+  ret void
 }
 
 define internal ptr @rx_capture_record(ptr %ctx, i64 %start, i64 %end) {

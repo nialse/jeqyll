@@ -5,6 +5,7 @@ declare double @m_exp(double)
 declare double @m_expm1(double)
 declare double @m_log(double)
 declare double @m_log1p(double)
+declare double @m_precise_log1p(double)
 declare double @m_scale_bits(double, i64)
 declare i64 @m_parts(double, ptr)
 declare double @m_fma(double, double, double)
@@ -71,7 +72,7 @@ asinhsmall:
   %den = fadd double %root, 1.000000e+00
   %fraction = fdiv double %aa, %den
   %arg = fadd double %a, %fraction
-  %smalllog = call double @m_log1p(double %arg)
+  %smalllog = call double @m_precise_log1p(double %arg)
   br label %asinhsign
 asinhsign:
   %asinhmag = phi double [%alplus, %asinhlog], [%smalllog, %asinhsmall]
@@ -94,7 +95,7 @@ acoshsmall:
   %product = fmul double %xm, %xp
   %acoshroot = call double @llvm.sqrt.f64(double %product)
   %acosharg = fadd double %xm, %acoshroot
-  %acoshresult = call double @m_log1p(double %acosharg)
+  %acoshresult = call double @m_precise_log1p(double %acosharg)
   ret double %acoshresult
 atanh:
   %atanhtiny = fcmp olt double %a, 3.7252902984619141e-09

@@ -41,6 +41,7 @@
 @c_zero = private constant [1 x i8] zeroinitializer
 @c_rs = private constant [1 x i8] c"\1E"
 @c_stdin = private constant [8 x i8] c"<stdin>\00"
+@c_unknown = private constant [10 x i8] c"<unknown>\00"
 @c_args_name = private constant [5 x i8] c"ARGS\00"
 @c_ENV_name = private constant [4 x i8] c"ENV\00"
 @c_named = private constant [6 x i8] c"named\00"
@@ -150,6 +151,7 @@ declare void @j_collect_start()
 declare ptr @j_gc_value(ptr)
 declare ptr @j_input_new(ptr, i32)
 declare ptr @j_input_next(ptr)
+declare void @j_input_defer(ptr, i1)
 declare ptr @j_input_name(ptr)
 declare i64 @j_input_line(ptr)
 declare i32 @j_input_status(ptr)
@@ -253,7 +255,8 @@ print:
   %str = icmp eq i32 %tag, 4
   br i1 %str, label %raw, label %json
 raw:
-  call void @cli_string(i32 2, ptr %err)
+  %errbytes = call ptr @cli_data(ptr %err)
+  call void @cli_text(i32 2, ptr %errbytes)
   br label %newline
 json:
   %dump = call ptr @j_dump(ptr %err, i32 0)
@@ -277,7 +280,10 @@ begin:
   call void @cli_text(i32 2, ptr @c_runtime_at)
   %filename = load ptr, ptr @cli_filename
   %hasname = icmp ne ptr %filename, null
-  br i1 %hasname, label %nametype, label %stdin
+  br i1 %hasname, label %nametype, label %unknown
+unknown:
+  call void @cli_text(i32 2, ptr @c_unknown)
+  br label %message
 nametype:
   %ft = load i32, ptr %filename
   %string = icmp eq i32 %ft, 4
@@ -291,18 +297,19 @@ stdin:
 line:
   call void @cli_text(i32 2, ptr @c_colon)
   %lineno = load i64, ptr @cli_line
-  %positive = icmp sgt i64 %lineno, 0
-  %number = select i1 %positive, i64 %lineno, i64 1
-  %d = uitofp i64 %number to double
+  %d = uitofp i64 %lineno to double
   %v = call ptr @j_num(double %d)
   %s = call ptr @j_dump(ptr %v, i32 0)
   call void @cli_string(i32 2, ptr %s)
+  br label %message
+message:
   call void @cli_text(i32 2, ptr @c_runtime_close)
   %tag = load i32, ptr %error
   %str = icmp eq i32 %tag, 4
   br i1 %str, label %raw, label %json
 raw:
-  call void @cli_string(i32 2, ptr %error)
+  %errorbytes = call ptr @cli_data(ptr %error)
+  call void @cli_text(i32 2, ptr %errorbytes)
   br label %newline
 json:
   %dump = call ptr @j_dump(ptr %error, i32 0)
@@ -731,8 +738,14 @@ finish:
 }
 
 define ptr @cli_take_input() {
+  %value = call ptr @cli_take_next(i1 true)
+  ret ptr %value
+}
+
+define internal ptr @cli_take_next(i1 %defer) {
 entry:
   %reader = load ptr, ptr @cli_reader
+  call void @j_input_defer(ptr %reader, i1 %defer)
   %value = call ptr @j_input_next(ptr %reader)
   %status = call i32 @j_input_status(ptr %reader)
   store i32 %status, ptr @cli_input_status
@@ -1439,7 +1452,7 @@ runloop:
   %stop = or i1 %halted, %outputfailed
   br i1 %stop, label %finish, label %runnext
 runnext:
-  %in = call ptr @cli_take_input()
+  %in = call ptr @cli_take_next(i1 false)
   %eof = icmp eq ptr %in, null
   br i1 %eof, label %inputend, label %evaluate
 inputend:
@@ -1456,6 +1469,7 @@ inputerror:
   br i1 %inputio, label %runloop, label %finish
 evaluate:
   %inputval = phi ptr [ %nullval, %nullvalue ], [ %in, %runnext ]
+  store i32 0, ptr @cli_exit_code
   call void @j_iter_into(ptr %iterator, ptr %ast, ptr %inputval, ptr %env)
   br label %resultloop
 resultloop:

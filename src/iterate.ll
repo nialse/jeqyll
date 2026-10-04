@@ -46,6 +46,7 @@ declare i1 @j_truth(ptr)
 declare ptr @j_binary(i32, ptr, ptr)
 declare ptr @j_negate(ptr)
 declare void @j_fail(ptr)
+declare void @j_object_key_error(ptr)
 declare ptr @j_eval_atom(ptr, ptr, ptr)
 declare ptr @j_bind(ptr, ptr, ptr)
 declare ptr @ev_node(i32, i32, ptr, ptr, ptr, ptr)
@@ -1148,7 +1149,7 @@ kobjectkey:
   %stringkey = icmp eq i32 %keytype, 4
   br i1 %stringkey, label %objectkeyvalid, label %objectkeybad
 objectkeybad:
-  call void @j_fail(ptr @g_keyerror)
+  call void @j_object_key_error(ptr %value)
   br label %raise
 objectkeyvalid:
   %nextpair = add i64 %kx, 2

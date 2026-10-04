@@ -10,6 +10,8 @@ declare void @j_fail(ptr)
 declare ptr @b_data(ptr)
 declare i64 @b_len(ptr)
 declare i64 @rx_run(ptr, ptr, i64, ptr, i64)
+declare i1 @rx_guard(ptr, ptr, i64)
+declare i64 @rx_call_level(ptr)
 declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
 
 define internal void @rr_copy(ptr %destination, ptr %source, i64 %bytes) {
@@ -38,83 +40,10 @@ define internal i64 @rr_capture_bytes(ptr %ctx) {
   ret i64 %bytes
 }
 
-define i64 @rx_split(ptr %node, ptr %ctx, i64 %pos, ptr %captures, i64 %depth) {
-entry:
-  %vp = getelementptr %RC, ptr %ctx, i32 0, i32 10
-  %visited = load ptr, ptr %vp
-  br label %guard
-guard:
-  %v = phi ptr [%visited, %entry], [%previous, %guardnext]
-  %empty = icmp eq ptr %v, null
-  br i1 %empty, label %begin, label %guardread
-guardread:
-  %active = load ptr, ptr %v
-  %pp = getelementptr i64, ptr %v, i64 1
-  %activepos = load i64, ptr %pp
-  %samenode = icmp eq ptr %active, %node
-  %samepos = icmp eq i64 %activepos, %pos
-  %cycle = and i1 %samenode, %samepos
-  br i1 %cycle, label %fail, label %guardnext
-guardnext:
-  %np = getelementptr ptr, ptr %v, i64 2
-  %previous = load ptr, ptr %np
-  br label %guard
-begin:
-  %guardrow = alloca {ptr, i64, ptr}
-  store ptr %node, ptr %guardrow
-  %guardpos = getelementptr i64, ptr %guardrow, i64 1
-  %guardprev = getelementptr ptr, ptr %guardrow, i64 2
-  store i64 %pos, ptr %guardpos
-  store ptr %visited, ptr %guardprev
-  store ptr %guardrow, ptr %vp
-  %ap = getelementptr %RX, ptr %node, i32 0, i32 4
-  %bp = getelementptr %RX, ptr %node, i32 0, i32 5
-  %a = load ptr, ptr %ap
-  %b = load ptr, ptr %bp
-  %fp = getelementptr %RC, ptr %ctx, i32 0, i32 4
-  %flags = load i32, ptr %fp
-  %lb = and i32 %flags, 64
-  %longest = icmp ne i32 %lb, 0
-  %kp = getelementptr %RC, ptr %ctx, i32 0, i32 8
-  %oldkeep = load i64, ptr %kp
-  %bytes = call i64 @rr_capture_bytes(ptr %ctx)
-  %before = call ptr @j_alloc(i64 %bytes)
-  call void @rr_copy(ptr %before, ptr %captures, i64 %bytes)
-  %left = call i64 @rx_run(ptr %a, ptr %ctx, i64 %pos, ptr %captures, i64 %depth)
-  %leftok = icmp sge i64 %left, 0
-  %shortest = xor i1 %longest, true
-  %acceptfirst = and i1 %leftok, %shortest
-  br i1 %acceptfirst, label %leftdone, label %right
-right:
-  %leftkeep = load i64, ptr %kp
-  %leftcaps = call ptr @j_alloc(i64 %bytes)
-  call void @rr_copy(ptr %leftcaps, ptr %captures, i64 %bytes)
-  call void @rr_copy(ptr %captures, ptr %before, i64 %bytes)
-  store i64 %oldkeep, ptr %kp
-  %rightresult = call i64 @rx_run(ptr %b, ptr %ctx, i64 %pos, ptr %captures, i64 %depth)
-  %preferleft = icmp sge i64 %left, %rightresult
-  %useleft = and i1 %preferleft, %leftok
-  br i1 %useleft, label %restoreleft, label %rightdone
-restoreleft:
-  call void @rr_copy(ptr %captures, ptr %leftcaps, i64 %bytes)
-  store i64 %leftkeep, ptr %kp
-  br label %leftdone
-leftdone:
-  store ptr %visited, ptr %vp
-  ret i64 %left
-rightdone:
-  store ptr %visited, ptr %vp
-  ret i64 %rightresult
-fail:
-  ret i64 -1
-}
-
 define i64 @rx_assert(ptr %node, ptr %ctx, i64 %pos, ptr %captures, i64 %depth) {
 entry:
   %op = load i32, ptr %node
-  %ap = getelementptr %RX, ptr %node, i32 0, i32 4
   %bp = getelementptr %RX, ptr %node, i32 0, i32 5
-  %next = load ptr, ptr %ap
   %inner = load ptr, ptr %bp
   %negativeahead = icmp eq i32 %op, 12
   %negativebehind = icmp eq i32 %op, 16
@@ -137,7 +66,6 @@ entry:
   %visitedp = getelementptr %RC, ptr %innerctx, i32 0, i32 10
   store ptr null, ptr %visitedp
   %kp = getelementptr %RC, ptr %ctx, i32 0, i32 8
-  %beforekeep = load i64, ptr %kp
   br label %try
 try:
   %start = phi i64 [%pos, %entry], [%previous, %advance]
@@ -165,15 +93,7 @@ success:
 continue:
   %after = phi i64 [%pos, %notfound], [%result, %success]
   %nextpos = select i1 %atomic, i64 %after, i64 %pos
-  %continued = call i64 @rx_run(ptr %next, ptr %ctx, i64 %nextpos, ptr %captures, i64 %depth)
-  %ok = icmp sge i64 %continued, 0
-  br i1 %ok, label %done, label %restore
-restore:
-  call void @rr_copy(ptr %captures, ptr %before, i64 %bytes)
-  store i64 %beforekeep, ptr %kp
-  br label %fail
-done:
-  ret i64 %continued
+  ret i64 %nextpos
 fail:
   ret i64 -1
 }
@@ -251,27 +171,16 @@ missing:
   ret i32 -1
 }
 
-define i64 @rx_call(ptr %node, ptr %ctx, i64 %pos, ptr %captures, i64 %depth) {
+define ptr @rx_call(ptr %node, ptr %ctx, i64 %pos) {
 entry:
+  %level = call i64 @rx_call_level(ptr %ctx)
+  %atlimit = icmp uge i64 %level, 20
+  br i1 %atlimit, label %fail, label %guard
+guard:
   %vp = getelementptr %RC, ptr %ctx, i32 0, i32 10
   %visited = load ptr, ptr %vp
-  br label %guard
-guard:
-  %active = phi ptr [%visited, %entry], [%previous, %guardnext]
-  %empty = icmp eq ptr %active, null
-  br i1 %empty, label %resolve, label %guardread
-guardread:
-  %activenode = load ptr, ptr %active
-  %activepp = getelementptr i64, ptr %active, i64 1
-  %activepos = load i64, ptr %activepp
-  %samenode = icmp eq ptr %activenode, %node
-  %samepos = icmp eq i64 %activepos, %pos
-  %cycle = and i1 %samenode, %samepos
-  br i1 %cycle, label %fail, label %guardnext
-guardnext:
-  %prevp = getelementptr ptr, ptr %active, i64 2
-  %previous = load ptr, ptr %prevp
-  br label %guard
+  %allowed = call i1 @rx_guard(ptr %node, ptr %ctx, i64 %pos)
+  br i1 %allowed, label %resolve, label %fail
 resolve:
   %bp = getelementptr %RX, ptr %node, i32 0, i32 1
   %base = load i32, ptr %bp
@@ -293,13 +202,6 @@ rootcheck:
   %root = and i1 %single, %zero
   br i1 %root, label %prepare, label %invalid
 prepare:
-  %guardrow = alloca {ptr, i64, ptr}
-  store ptr %node, ptr %guardrow
-  %guardpp = getelementptr i64, ptr %guardrow, i64 1
-  %guardvp = getelementptr ptr, ptr %guardrow, i64 2
-  store i64 %pos, ptr %guardpp
-  store ptr %visited, ptr %guardvp
-  store ptr %guardrow, ptr %vp
   %groupsp = getelementptr %RC, ptr %ctx, i32 0, i32 12
   %groups = load ptr, ptr %groupsp
   %index = add i32 %id, 1
@@ -307,7 +209,7 @@ prepare:
   %body = call ptr @j_at(ptr %groups, i64 %index64)
   %stackp = getelementptr %RC, ptr %ctx, i32 0, i32 13
   %stack = load ptr, ptr %stackp
-  %frame = alloca {ptr, ptr, i64}
+  %frame = call ptr @j_alloc(i64 40)
   store ptr %next, ptr %frame
   %frameprev = getelementptr ptr, ptr %frame, i64 1
   store ptr %stack, ptr %frameprev
@@ -315,19 +217,21 @@ prepare:
   %limit = load i64, ptr %limitp
   %framelimit = getelementptr i64, ptr %frame, i64 2
   store i64 %limit, ptr %framelimit
+  %framevisited = getelementptr ptr, ptr %frame, i64 3
+  store ptr %visited, ptr %framevisited
+  %framelevel = getelementptr i64, ptr %frame, i64 4
+  %nextlevel = add i64 %level, 1
+  store i64 %nextlevel, ptr %framelevel
   store ptr %frame, ptr %stackp
-  %result = call i64 @rx_run(ptr %body, ptr %ctx, i64 %pos, ptr %captures, i64 %depth)
-  store ptr %stack, ptr %stackp
-  store ptr %visited, ptr %vp
-  ret i64 %result
+  ret ptr %body
 invalid:
   call void @j_fail(ptr @rr_badref)
   br label %fail
 fail:
-  ret i64 -1
+  ret ptr null
 }
 
-define i64 @rx_return(ptr %ctx, i64 %pos, ptr %captures, i64 %depth) {
+define ptr @rx_return(ptr %ctx) {
 entry:
   %stackp = getelementptr %RC, ptr %ctx, i32 0, i32 13
   %frame = load ptr, ptr %stackp
@@ -340,15 +244,15 @@ return:
   %lp = getelementptr i64, ptr %frame, i64 2
   %outerlimit = load i64, ptr %lp
   %limitp = getelementptr %RC, ptr %ctx, i32 0, i32 14
-  %innerlimit = load i64, ptr %limitp
   store i64 %outerlimit, ptr %limitp
   store ptr %previous, ptr %stackp
-  %result = call i64 @rx_run(ptr %next, ptr %ctx, i64 %pos, ptr %captures, i64 %depth)
-  store ptr %frame, ptr %stackp
-  store i64 %innerlimit, ptr %limitp
-  ret i64 %result
+  %visitedp = getelementptr %RC, ptr %ctx, i32 0, i32 10
+  %framevisitedp = getelementptr ptr, ptr %frame, i64 3
+  %visited = load ptr, ptr %framevisitedp
+  store ptr %visited, ptr %visitedp
+  ret ptr %next
 done:
-  ret i64 %pos
+  ret ptr null
 }
 
 define i64 @rx_absent(ptr %node, ptr %ctx, i64 %pos, ptr %captures, i64 %depth) {
@@ -419,12 +323,19 @@ stopper:
 scoped:
   %stackp = getelementptr %RC, ptr %ctx, i32 0, i32 13
   %stack = load ptr, ptr %stackp
-  %frame = alloca {ptr, ptr, i64}
+  %frame = alloca {ptr, ptr, i64, ptr, i64}
   store ptr %next, ptr %frame
   %prevp = getelementptr ptr, ptr %frame, i64 1
   %framelimit = getelementptr i64, ptr %frame, i64 2
   store ptr %stack, ptr %prevp
   store i64 %oldlimit, ptr %framelimit
+  %scopedvisitedp = getelementptr %RC, ptr %ctx, i32 0, i32 10
+  %scopedvisited = load ptr, ptr %scopedvisitedp
+  %framevisitedp = getelementptr ptr, ptr %frame, i64 3
+  store ptr %scopedvisited, ptr %framevisitedp
+  %scopedlevel = call i64 @rx_call_level(ptr %ctx)
+  %framelevelp = getelementptr i64, ptr %frame, i64 4
+  store i64 %scopedlevel, ptr %framelevelp
   store ptr %frame, ptr %stackp
   store i64 %limit, ptr %lp
   %scopedresult = call i64 @rx_run(ptr %expression, ptr %ctx, i64 %pos, ptr %captures, i64 %depth)
@@ -474,7 +385,7 @@ done:
   ret i64 %result
 }
 
-define i64 @rx_conditional(ptr %node, ptr %ctx, i64 %pos, ptr %captures, i64 %depth) {
+define {ptr, i64} @rx_conditional(ptr %node, ptr %ctx, i64 %pos, ptr %captures, i64 %depth) {
 entry:
   %ap = getelementptr %RX, ptr %node, i32 0, i32 4
   %bp = getelementptr %RX, ptr %node, i32 0, i32 5
@@ -497,19 +408,14 @@ entry:
   %matched = icmp sge i64 %end, 0
   br i1 %matched, label %positive, label %negative
 positive:
-  %yesresult = call i64 @rx_run(ptr %yes, ptr %ctx, i64 %end, ptr %captures, i64 %depth)
   br label %finish
 negative:
   call void @rr_copy(ptr %captures, ptr %before, i64 %bytes)
-  %noresult = call i64 @rx_run(ptr %no, ptr %ctx, i64 %pos, ptr %captures, i64 %depth)
   br label %finish
 finish:
-  %result = phi i64 [%yesresult, %positive], [%noresult, %negative]
-  %ok = icmp sge i64 %result, 0
-  br i1 %ok, label %done, label %restore
-restore:
-  call void @rr_copy(ptr %captures, ptr %before, i64 %bytes)
-  br label %done
-done:
-  ret i64 %result
+  %nextnode = phi ptr [%yes, %positive], [%no, %negative]
+  %nextpos = phi i64 [%end, %positive], [%pos, %negative]
+  %pair = insertvalue {ptr, i64} poison, ptr %nextnode, 0
+  %result = insertvalue {ptr, i64} %pair, i64 %nextpos, 1
+  ret {ptr, i64} %result
 }
