@@ -7,6 +7,8 @@
 @diag_unknown = private constant [13 x i8] c"syntax error\00"
 @diag_input_at = private constant [10 x i8] c" at line \00"
 @diag_input_eof = private constant [8 x i8] c" at EOF\00"
+@diag_file_at = private constant [5 x i8] c" at \00"
+@diag_file_line = private constant [8 x i8] c", line \00"
 @j_parse_error_eof = external global i1
 
 declare ptr @j_num(double)
@@ -80,6 +82,11 @@ finish:
 }
 
 define ptr @j_compile_diagnostic(ptr %source, i64 %length, i64 %begin, i64 %end, ptr %message) {
+  %result = call ptr @j_compile_file_diagnostic(ptr %source, i64 %length, i64 %begin, i64 %end, ptr %message, ptr null)
+  ret ptr %result
+}
+
+define ptr @j_compile_file_diagnostic(ptr %source, i64 %length, i64 %begin, i64 %end, ptr %message, ptr %filename) {
 entry:
   %buffer = call ptr @j_buffer_new()
   %past = icmp ugt i64 %begin, %length
@@ -132,7 +139,17 @@ linenext:
 render:
   %offset = sub i64 %position, %linestart
   %column = add i64 %offset, 1
+  %named = icmp ne ptr %filename, null
+  br i1 %named, label %namedfile, label %topfile
+namedfile:
+  call void @diag_text(ptr %buffer, ptr @diag_file_at)
+  call void @diag_value(ptr %buffer, ptr %filename)
+  call void @diag_text(ptr %buffer, ptr @diag_file_line)
+  br label %renderline
+topfile:
   call void @diag_text(ptr %buffer, ptr @diag_at)
+  br label %renderline
+renderline:
   call void @diag_integer(ptr %buffer, i64 %line)
   call void @diag_text(ptr %buffer, ptr @diag_column)
   call void @diag_integer(ptr %buffer, i64 %column)
@@ -143,7 +160,7 @@ render:
   call void @diag_text(ptr %buffer, ptr @diag_carets)
   br label %spaces
 spaces:
-  %k = phi i64 [ 0, %render ], [ %kn, %space ]
+  %k = phi i64 [ 0, %renderline ], [ %kn, %space ]
   %aligned = icmp uge i64 %k, %offset
   br i1 %aligned, label %caretbegin, label %space
 space:

@@ -16,6 +16,8 @@
 @j_parse_error_offset = external global i64
 @j_parse_error_message = external global ptr
 @j_parse_error_path = external global ptr
+@j_fs_search_error = external global ptr
+@mtrt_errno_EINTR = external constant i32
 @cli_flags = internal global i32 0
 @cli_filename = internal global ptr null
 @cli_line = internal global i64 0
@@ -24,12 +26,14 @@
 @cli_source_lines = internal global ptr null
 @cli_source_position = internal global i64 0
 @cli_source_line = internal global i64 1
-@cli_halted = internal global i1 false
+@cli_halted = global i1 false
 @cli_halt_code = internal global i32 0
 @cli_exit_code = internal global i32 0
 @cli_last = internal global i32 4
 @cli_stdin_seen = internal global i1 false
 @cli_write_failed = internal global i1 false
+@cli_reader = internal global ptr null
+@cli_input_status = internal global i32 0
 
 @c_dot = private constant [2 x i8] c".\00"
 @c_dash = private constant [2 x i8] c"-\00"
@@ -100,6 +104,10 @@
 @c_line = private constant [18 x i8] c"input_line_number\00"
 @c_eof = private constant [6 x i8] c"break\00"
 @c_DEBUG = private constant [7 x i8] c"DEBUG:\00"
+@c_build_opt = private constant [22 x i8] c"--build-configuration\00"
+@c_build_key = private constant [23 x i8] c"JQ_BUILD_CONFIGURATION\00"
+@c_build_info = private constant [44 x i8] c"LLVM IR; libmuffintop; static; linux-x86_64\00"
+@c_program_nul = private constant [32 x i8] c"program file contains NUL bytes\00"
 @cli_builtin_names = private constant [80 x i8] c"env\00input\00inputs\00debug\00stderr\00halt\00halt_error\00input_filename\00input_line_number\00\00"
 
 declare ptr @j_alloc(i64)
@@ -127,7 +135,6 @@ declare ptr @j_compile_diagnostic(ptr, i64, i64, i64, ptr)
 declare ptr @j_input_diagnostic(ptr, i64, i64, ptr)
 declare ptr @j_colorize(ptr)
 declare void @j_color_init()
-declare ptr @j_home_source(ptr)
 declare ptr @j_disassemble(ptr)
 declare ptr @j_fold_constants(ptr)
 declare ptr @j_seq_parse(ptr, i1)
@@ -136,7 +143,21 @@ declare void @j_buffer_append(ptr, ptr, i64)
 declare void @j_buffer_byte(ptr, i8)
 declare ptr @j_buffer_value(ptr)
 declare ptr @j_eval(ptr, ptr, ptr)
+declare ptr @j_iter(ptr, ptr, ptr)
+declare ptr @j_next(ptr)
+declare void @j_iter_into(ptr, ptr, ptr, ptr)
+declare void @j_collect_start()
+declare ptr @j_gc_value(ptr)
+declare ptr @j_input_new(ptr, i32)
+declare ptr @j_input_next(ptr)
+declare ptr @j_input_name(ptr)
+declare i64 @j_input_line(ptr)
+declare i32 @j_input_status(ptr)
+declare void @j_input_trace(ptr)
+declare void @j_input_close(ptr)
+declare void @j_fs_init(ptr, ptr)
 declare ptr @j_bind(ptr, ptr, ptr)
+declare ptr @ev_lookup(ptr, ptr, i32, i64)
 declare ptr @j_binary(i32, ptr, ptr)
 declare i32 @b_find(ptr, ptr)
 declare void @_exit(i32) noreturn
@@ -185,7 +206,15 @@ loop:
 body:
   %at = getelementptr i8, ptr %p, i64 %pos
   %left = sub i64 %n, %pos
+  br label %writeattempt
+writeattempt:
   %w = call i64 @write(i32 %fd, ptr %at, i64 %left)
+  %eintr = load i32, ptr @mtrt_errno_EINTR
+  %eintr64 = sext i32 %eintr to i64
+  %negativeintr = sub i64 0, %eintr64
+  %interrupted = icmp eq i64 %w, %negativeintr
+  br i1 %interrupted, label %writeattempt, label %writecheck
+writecheck:
   %ok = icmp sgt i64 %w, 0
   br i1 %ok, label %advance, label %bad
 advance:
@@ -377,7 +406,15 @@ grow:
 read:
   %dest = getelementptr i8, ptr %base, i64 %used
   %remaining = sub i64 %cap, %used
+  br label %readattempt
+readattempt:
   %count = call i64 @read(i32 %fd, ptr %dest, i64 %remaining)
+  %eintr = load i32, ptr @mtrt_errno_EINTR
+  %eintr64 = sext i32 %eintr to i64
+  %negativeintr = sub i64 0, %eintr64
+  %interrupted = icmp eq i64 %count, %negativeintr
+  br i1 %interrupted, label %readattempt, label %readcheck
+readcheck:
   %bad = icmp slt i64 %count, 0
   br i1 %bad, label %error, label %eofcheck
 eofcheck:
@@ -396,7 +433,14 @@ error:
 
 define ptr @j_read_file(ptr %path) {
 entry:
+  br label %openattempt
+openattempt:
   %fd = call i32 @open(ptr %path, i32 0, i32 0)
+  %eintr = load i32, ptr @mtrt_errno_EINTR
+  %negativeintr = sub i32 0, %eintr
+  %interrupted = icmp eq i32 %fd, %negativeintr
+  br i1 %interrupted, label %openattempt, label %opencheck
+opencheck:
   %bad = icmp slt i32 %fd, 0
   br i1 %bad, label %error, label %read
 read:
@@ -686,29 +730,46 @@ finish:
   ret void
 }
 
-define internal ptr @cli_take_input() {
+define ptr @cli_take_input() {
 entry:
-  %all = load ptr, ptr @j_inputs
-  %pos = load i64, ptr @j_input_pos
-  %n = call i64 @cli_len(ptr %all)
-  %done = icmp uge i64 %pos, %n
-  br i1 %done, label %end, label %take
-take:
-  %v = call ptr @j_at(ptr %all, i64 %pos)
-  %next = add i64 %pos, 1
-  store i64 %next, ptr @j_input_pos
-  %names = load ptr, ptr @cli_names
-  %name = call ptr @j_at(ptr %names, i64 %pos)
+  %reader = load ptr, ptr @cli_reader
+  %value = call ptr @j_input_next(ptr %reader)
+  %status = call i32 @j_input_status(ptr %reader)
+  store i32 %status, ptr @cli_input_status
+  %name = call ptr @j_input_name(ptr %reader)
   store ptr %name, ptr @cli_filename
-  %lines = load ptr, ptr @cli_lines
-  %line = call ptr @j_at(ptr %lines, i64 %pos)
-  %np = getelementptr %V, ptr %line, i32 0, i32 2
-  %nd = load double, ptr %np
-  %ni = fptosi double %nd to i64
-  store i64 %ni, ptr @cli_line
-  ret ptr %v
-end:
-  ret ptr null
+  %line = call i64 @j_input_line(ptr %reader)
+  store i64 %line, ptr @cli_line
+  %failed = icmp ne i32 %status, 0
+  br i1 %failed, label %error, label %done
+error:
+  %message = load ptr, ptr @j_error
+  store ptr %message, ptr @j_deferred_input_error
+  store ptr null, ptr @j_error
+  br label %done
+done:
+  ret ptr %value
+}
+
+define void @cli_trace() {
+  %reader = load ptr, ptr @cli_reader
+  call void @j_input_trace(ptr %reader)
+  %searcherror = load ptr, ptr @j_fs_search_error
+  %newsearcherror = call ptr @j_gc_value(ptr %searcherror)
+  store ptr %newsearcherror, ptr @j_fs_search_error
+  %error = load ptr, ptr @j_error
+  %newerror = call ptr @j_gc_value(ptr %error)
+  store ptr %newerror, ptr @j_error
+  %pending = load ptr, ptr @j_deferred_input_error
+  %newpending = call ptr @j_gc_value(ptr %pending)
+  store ptr %newpending, ptr @j_deferred_input_error
+  %name = load ptr, ptr @cli_filename
+  %newname = call ptr @j_gc_value(ptr %name)
+  store ptr %newname, ptr @cli_filename
+  %compileerrors = load ptr, ptr @j_compile_errors
+  %newcompileerrors = call ptr @j_gc_value(ptr %compileerrors)
+  store ptr %newcompileerrors, ptr @j_compile_errors
+  ret void
 }
 
 define ptr @j_cli_builtin(ptr %name, ptr %args, ptr %input, ptr %env) {
@@ -882,7 +943,7 @@ one:
 }
 
 %Option = type { ptr, i32, i32 }
-@cli_options = private constant [30 x %Option] [
+@cli_options = private constant [31 x %Option] [
   %Option { ptr @c_null_input, i32 1, i32 2 },
   %Option { ptr @c_raw_input, i32 1, i32 1 },
   %Option { ptr @c_slurp, i32 1, i32 4 },
@@ -912,7 +973,8 @@ one:
   %Option { ptr @c_args, i32 11, i32 0 },
   %Option { ptr @c_jsonargs, i32 12, i32 0 },
   %Option { ptr @c_endopts, i32 13, i32 0 },
-  %Option { ptr @c_tab, i32 14, i32 0 }
+  %Option { ptr @c_tab, i32 14, i32 0 },
+  %Option { ptr @c_build_opt, i32 15, i32 0 }
 ]
 
 define internal void @cli_stream(ptr %v, ptr %path, ptr %out) {
@@ -1051,10 +1113,10 @@ option:
   br i1 %islong, label %longloop, label %shortloop
 longloop:
   %oi = phi i64 [ 0, %option ], [ %onext, %longnext ]
-  %oend = icmp eq i64 %oi, 30
+  %oend = icmp eq i64 %oi, 31
   br i1 %oend, label %unknownoption, label %longcheck
 longcheck:
-  %op = getelementptr [30 x %Option], ptr @cli_options, i64 0, i64 %oi
+  %op = getelementptr [31 x %Option], ptr @cli_options, i64 0, i64 %oi
   %oname = load ptr, ptr %op
   %matches = call i1 @j_is(ptr %argument, ptr %oname)
   br i1 %matches, label %longmatched, label %longnext
@@ -1069,7 +1131,7 @@ longmatched:
   switch i32 %oaction, label %longparam [
     i32 1, label %longflag i32 2, label %help i32 3, label %version
     i32 11, label %stringmode i32 12, label %jsonmode i32 13, label %endoptions
-    i32 14, label %tabindent
+    i32 14, label %tabindent i32 15, label %buildconfiguration
   ]
 longflag:
   %oldlf = load i32, ptr @cli_flags
@@ -1236,6 +1298,11 @@ version:
   call void @cli_text(i32 1, ptr @c_version)
   call void @_exit(i32 0)
   unreachable
+buildconfiguration:
+  call void @cli_text(i32 1, ptr @c_build_info)
+  call void @cli_text(i32 1, ptr @c_nl)
+  call void @_exit(i32 0)
+  unreachable
 unknownoption:
   call void @j_fail(ptr @c_option_error)
   br label %argerror
@@ -1247,6 +1314,17 @@ argerror:
   call void @_exit(i32 2)
   unreachable
 argsdone:
+  %buildkey = call ptr @j_cstr(ptr @c_build_key)
+  %beforebuildenv = load ptr, ptr %envslot
+  %existingbuild = call ptr @ev_lookup(ptr %beforebuildenv, ptr %buildkey, i32 0, i64 0)
+  %hasbuild = icmp ne ptr %existingbuild, null
+  br i1 %hasbuild, label %argsready, label %defaultbuild
+defaultbuild:
+  %buildinfo = call ptr @j_cstr(ptr @c_build_info)
+  %withbuildenv = call ptr @j_bind(ptr %beforebuildenv, ptr %buildkey, ptr %buildinfo)
+  store ptr %withbuildenv, ptr %envslot
+  br label %argsready
+argsready:
   call void @j_color_init()
   %colorflags = load i32, ptr @cli_flags
   %explicitcolor = and i32 %colorflags, 4096
@@ -1293,12 +1371,27 @@ readprogram:
   %progpath = call ptr @cli_data(ptr %prog)
   %progtext = call ptr @j_read_file(ptr %progpath)
   %progreaddone = icmp ne ptr %progtext, null
-  br i1 %progreaddone, label %compile, label %argerror
+  br i1 %progreaddone, label %programbytes, label %argerror
+programbytes:
+  %programdata = call ptr @cli_data(ptr %progtext)
+  %programlength = call i64 @cli_len(ptr %progtext)
+  %programcstring = call i64 @j_strlen(ptr %programdata)
+  %programhasnul = icmp ne i64 %programlength, %programcstring
+  br i1 %programhasnul, label %programnulerror, label %compile
+programnulerror:
+  call void @j_fail(ptr @c_program_nul)
+  call void @cli_error(i32 2, ptr @c_compile_prefix)
+  call void @_exit(i32 2)
+  unreachable
 compile:
-  %text = phi ptr [ %identity, %defaultprogram ], [ %prog, %hasprogram ], [ %progtext, %readprogram ]
-  %withhome = call ptr @j_home_source(ptr %text)
-  %source = call ptr @cli_data(ptr %withhome)
-  %sourcelen = call i64 @cli_len(ptr %withhome)
+  %text = phi ptr [ %identity, %defaultprogram ], [ %prog, %hasprogram ], [ %progtext, %programbytes ]
+  %argv0p = load ptr, ptr %argv
+  %argv0 = call ptr @j_cstr(ptr %argv0p)
+  %programfileflag = load i1, ptr %fromfile
+  %originprogramfile = select i1 %programfileflag, ptr %prog, ptr null
+  call void @j_fs_init(ptr %argv0, ptr %originprogramfile)
+  %source = call ptr @cli_data(ptr %text)
+  %sourcelen = call i64 @cli_len(ptr %text)
   store ptr %env, ptr @j_compile_env
   %compiledast = call ptr @j_compile(ptr %source, i64 %sourcelen)
   %compiled = icmp ne ptr %compiledast, null
@@ -1322,154 +1415,20 @@ compileerror:
   unreachable
 readinputs:
   %flags = load i32, ptr @cli_flags
-  %rawbit = and i32 %flags, 1
-  %raw = icmp ne i32 %rawbit, 0
-  %slurpbit = and i32 %flags, 4
-  %slurp = icmp ne i32 %slurpbit, 0
-  %rawslurp = and i1 %raw, %slurp
   %nullbit = and i32 %flags, 2
   %nullinput = icmp ne i32 %nullbit, 0
-  %streambit = and i32 %flags, 1024
-  %streamflag = icmp ne i32 %streambit, 0
-  %notraw = xor i1 %raw, true
-  %streaming = and i1 %streamflag, %notraw
-  %streamerrbit = and i32 %flags, 16384
-  %streamerrors = icmp ne i32 %streamerrbit, 0
-  %allvalues = call ptr @j_array()
   %filecount = call i64 @cli_len(ptr %files)
   %nofiles = icmp eq i64 %filecount, 0
-  br i1 %nofiles, label %defaultstdin, label %filebegin
+  br i1 %nofiles, label %defaultstdin, label %setinputs
 defaultstdin:
   %dashval = call ptr @j_cstr(ptr @c_dash)
   call void @j_push(ptr %files, ptr %dashval)
-  br label %filebegin
-filebegin:
-  %nfiles = call i64 @cli_len(ptr %files)
-  br label %fileloop
-fileloop:
-  %fi = phi i64 [ 0, %filebegin ], [ %finext, %nextfile ]
-  %fdone = icmp uge i64 %fi, %nfiles
-  br i1 %fdone, label %inputsdone, label %readone
-readone:
-  %filename = call ptr @j_at(ptr %files, i64 %fi)
-  %isstdin = call i1 @j_is(ptr %filename, ptr @c_dash)
-  br i1 %isstdin, label %readstdin, label %readpath
-readstdin:
-  %seen = load i1, ptr @cli_stdin_seen
-  br i1 %seen, label %nextfile, label %stdinbytes
-stdinbytes:
-  store i1 true, ptr @cli_stdin_seen
-  %stdindata = call ptr @cli_read_fd(i32 0)
-  br label %filedata
-readpath:
-  %filep = call ptr @cli_data(ptr %filename)
-  %filebytes = call ptr @j_read_file(ptr %filep)
-  br label %filedata
-filedata:
-  %content = phi ptr [ %stdindata, %stdinbytes ], [ %filebytes, %readpath ]
-  %displayname = phi ptr [ %stdinname, %stdinbytes ], [ %filename, %readpath ]
-  %hascontent = icmp ne ptr %content, null
-  br i1 %hascontent, label %parsefile, label %fileerror
-fileerror:
-  call void @cli_error(i32 2, ptr @c_jq_error)
-  br label %nextfile
-parsefile:
-  %filevalues = call ptr @cli_parse_all(ptr %content, i1 %raw, i1 %rawslurp, ptr %displayname, i1 true)
-  %filelines = load ptr, ptr @cli_source_lines
-  %parseerr = load ptr, ptr @j_error
-  %parseerrpath = load ptr, ptr @j_parse_error_path
-  %invalidfile = icmp ne ptr %parseerr, null
-  br i1 %invalidfile, label %reportparse, label %valuesbegin
-reportparse:
-  br i1 %streamerrors, label %streamerrorclear, label %inputerrorprint
-streamerrorclear:
-  store ptr null, ptr @j_error
-  br label %valuesbegin
-inputerrorprint:
-  call void @cli_error(i32 5, ptr @c_input_error)
-  br label %valuesbegin
-valuesbegin:
-  %valuen = call i64 @cli_len(ptr %filevalues)
-  br label %valuesloop
-valuesloop:
-  %vi2 = phi i64 [ 0, %valuesbegin ], [ %vinext, %appendvalue ], [ %vinext, %streamdone ]
-  %vend = icmp uge i64 %vi2, %valuen
-  br i1 %vend, label %filevaluesdone, label %valueone
-valueone:
-  %vv = call ptr @j_at(ptr %filevalues, i64 %vi2)
-  %linev = call ptr @j_at(ptr %filelines, i64 %vi2)
-  %linetag = load i32, ptr %linev
-  %hasline = icmp eq i32 %linetag, 3
-  %linep = getelementptr %V, ptr %linev, i32 0, i32 2
-  %lined = load double, ptr %linep
-  %linei = fptosi double %lined to i64
-  %defaultline = add i64 %vi2, 1
-  %lineno = select i1 %hasline, i64 %linei, i64 %defaultline
-  %vinext = add i64 %vi2, 1
-  br i1 %streaming, label %streamvalue, label %appendvalue
-appendvalue:
-  call void @cli_add_input(ptr %allvalues, ptr %vv, ptr %displayname, i64 %lineno)
-  br label %valuesloop
-streamvalue:
-  %events = call ptr @j_array()
-  %rootpath = call ptr @j_array()
-  call void @cli_stream(ptr %vv, ptr %rootpath, ptr %events)
-  %eventn = call i64 @cli_len(ptr %events)
-  br label %streamloop
-streamloop:
-  %ei = phi i64 [ 0, %streamvalue ], [ %enext, %streamappend ]
-  %eend = icmp uge i64 %ei, %eventn
-  br i1 %eend, label %streamdone, label %streamappend
-streamappend:
-  %ev = call ptr @j_at(ptr %events, i64 %ei)
-  call void @cli_add_input(ptr %allvalues, ptr %ev, ptr %displayname, i64 %lineno)
-  %enext = add i64 %ei, 1
-  br label %streamloop
-streamdone:
-  br label %valuesloop
-filevaluesdone:
-  %errorstream = and i1 %invalidfile, %streamerrors
-  br i1 %errorstream, label %streamerrorappend, label %nextfile
-streamerrorappend:
-  %errpair = call ptr @j_array()
-  call void @j_push(ptr %errpair, ptr %parseerr)
-  %emptypath = call ptr @j_array()
-  %haspath = icmp ne ptr %parseerrpath, null
-  %errpath = select i1 %haspath, ptr %parseerrpath, ptr %emptypath
-  call void @j_push(ptr %errpair, ptr %errpath)
-  call void @cli_add_input(ptr %allvalues, ptr %errpair, ptr %displayname, i64 1)
-  br label %nextfile
-nextfile:
-  %finext = add i64 %fi, 1
-  br label %fileloop
-inputsdone:
-  br i1 %slurp, label %slurpinput, label %setinputs
-slurpinput:
-  br i1 %raw, label %rawslurpbegin, label %jsonslurp
-jsonslurp:
-  br label %slurpwrap
-rawslurpbegin:
-  %emptystring = call ptr @j_cstr(ptr @c_zero)
-  %rsn = call i64 @cli_len(ptr %allvalues)
-  br label %rawslurploop
-rawslurploop:
-  %rsi = phi i64 [ 0, %rawslurpbegin ], [ %rsnext, %rawslurpappend ]
-  %joined = phi ptr [ %emptystring, %rawslurpbegin ], [ %rsjoined, %rawslurpappend ]
-  %rsdone = icmp uge i64 %rsi, %rsn
-  br i1 %rsdone, label %slurpwrap, label %rawslurpappend
-rawslurpappend:
-  %rsv = call ptr @j_at(ptr %allvalues, i64 %rsi)
-  %rsjoined = call ptr @j_binary(i32 0, ptr %joined, ptr %rsv)
-  %rsnext = add i64 %rsi, 1
-  br label %rawslurploop
-slurpwrap:
-  %slurped = phi ptr [ %allvalues, %jsonslurp ], [ %joined, %rawslurploop ]
-  %wrapped = call ptr @j_array()
-  call void @j_push(ptr %wrapped, ptr %slurped)
   br label %setinputs
 setinputs:
-  %inputs = phi ptr [ %allvalues, %inputsdone ], [ %wrapped, %slurpwrap ]
-  store ptr %inputs, ptr @j_inputs
+  %reader = call ptr @j_input_new(ptr %files, i32 %flags)
+  store ptr %reader, ptr @cli_reader
+  %iterator = alloca ptr
+  call void @j_collect_start()
   br i1 %nullinput, label %nullvalue, label %runloop
 nullvalue:
   %nullval = call ptr @j_null()
@@ -1482,22 +1441,32 @@ runloop:
 runnext:
   %in = call ptr @cli_take_input()
   %eof = icmp eq ptr %in, null
-  br i1 %eof, label %finish, label %evaluate
+  br i1 %eof, label %inputend, label %evaluate
+inputend:
+  %inputstatus = load i32, ptr @cli_input_status
+  %inputfailed = icmp ne i32 %inputstatus, 0
+  br i1 %inputfailed, label %inputerror, label %finish
+inputerror:
+  %inputmessage = load ptr, ptr @j_deferred_input_error
+  store ptr null, ptr @j_deferred_input_error
+  store ptr %inputmessage, ptr @j_error
+  %inputio = icmp eq i32 %inputstatus, 2
+  %inputprefix = select i1 %inputio, ptr @c_jq_error, ptr @c_input_error
+  call void @cli_error(i32 %inputstatus, ptr %inputprefix)
+  br i1 %inputio, label %runloop, label %finish
 evaluate:
   %inputval = phi ptr [ %nullval, %nullvalue ], [ %in, %runnext ]
-  %results = call ptr @j_eval(ptr %ast, ptr %inputval, ptr %env)
-  %resultn = call i64 @cli_len(ptr %results)
+  call void @j_iter_into(ptr %iterator, ptr %ast, ptr %inputval, ptr %env)
   br label %resultloop
 resultloop:
-  %ri = phi i64 [ 0, %evaluate ], [ %rinext, %resultone ]
-  %rend = icmp uge i64 %ri, %resultn
   %writefailed = load i1, ptr @cli_write_failed
-  %resultstop = or i1 %rend, %writefailed
-  br i1 %resultstop, label %resultdone, label %resultone
+  br i1 %writefailed, label %resultdone, label %resultnext
+resultnext:
+  %result = call ptr @j_next(ptr %iterator)
+  %rend = icmp eq ptr %result, null
+  br i1 %rend, label %resultdone, label %resultone
 resultone:
-  %result = call ptr @j_at(ptr %results, i64 %ri)
   call void @cli_emit(ptr %result)
-  %rinext = add i64 %ri, 1
   br label %resultloop
 resultdone:
   %error = load ptr, ptr @j_error
@@ -1509,6 +1478,14 @@ runtimeerror:
 continue:
   br i1 %nullinput, label %finish, label %runloop
 finish:
+  call void @j_input_close(ptr %reader)
+  %closeerror = load ptr, ptr @j_error
+  %closefailed = icmp ne ptr %closeerror, null
+  br i1 %closefailed, label %closefailure, label %exitstatus
+closefailure:
+  call void @cli_error(i32 2, ptr @c_jq_error)
+  br label %exitstatus
+exitstatus:
   %halt = load i1, ptr @cli_halted
   %hc = load i32, ptr @cli_halt_code
   %rc = load i32, ptr @cli_exit_code

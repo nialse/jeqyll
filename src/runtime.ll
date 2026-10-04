@@ -1,6 +1,9 @@
 %V = type { i32, i32, double, i64, i64, ptr, ptr }
 %Buffer = type { ptr, i64, i64 }
 %Decimal = type { i32, i32, i64, i64, ptr }
+%RoundInterval = type { ptr, ptr, i64, i64, i64, i64, i1 }
+%ArenaBlock = type { ptr, i64, ptr, i64 }
+%ArenaMark = type { ptr, ptr, i64 }
 
 @j_error = global ptr null
 @j_indent = global i32 2
@@ -16,6 +19,17 @@
 @compare_message = internal global ptr @error_compare_depth
 @arena_cursor = internal global ptr null
 @arena_left = internal global i64 0
+@arena_block = internal global ptr null
+@permanent_cursor = internal global ptr null
+@permanent_left = internal global i64 0
+@permanent_block = internal global ptr null
+@gc_active = internal global i1 false
+@gc_old_state = internal global %ArenaMark zeroinitializer
+@gc_base_mark = internal global %ArenaMark zeroinitializer
+@gc_table = internal global ptr null
+@gc_capacity = internal global i64 0
+@gc_count = internal global i64 0
+@j_gc_pressure = global i64 0
 @value_null = internal global %V zeroinitializer
 @value_false = internal global %V { i32 1, i32 0, double 0.0, i64 0, i64 0, ptr null, ptr null }
 @value_true = internal global %V { i32 2, i32 0, double 0.0, i64 0, i64 0, ptr null, ptr null }
@@ -37,6 +51,8 @@
 @error_binary = private constant [32 x i8] c"Incompatible types for operator\00"
 @error_zero = private constant [17 x i8] c"division by zero\00"
 @error_memory = private constant [20 x i8] c"jeqy: out of memory\0A"
+@error_checkpoint = private constant [25 x i8] c"Invalid arena checkpoint\00"
+@error_collection = private constant [34 x i8] c"Invalid copying collection state\00\00"
 @kind_number = private constant [7 x i8] c"number\00"
 @kind_boolean = private constant [8 x i8] c"boolean\00"
 @kind_string = private constant [7 x i8] c"string\00"
@@ -92,6 +108,7 @@
 @error_stream_missing_value = private constant [32 x i8] c"Missing value in key:value pair\00"
 
 declare i64 @mmap(i64, i64, i32, i32, i32, i64)
+declare i32 @munmap(i64, i64)
 declare i64 @write(i32, ptr, i64)
 declare void @_exit(i32) noreturn
 declare double @llvm.trunc.f64(double)
@@ -100,16 +117,23 @@ declare ptr @j_split(ptr, ptr)
 
 define ptr @j_alloc(i64 %bytes) {
 entry:
+  %overflow = icmp ugt i64 %bytes, 9223372036854770000
+  br i1 %overflow, label %failure, label %sizecheck
+sizecheck:
   %plus = add i64 %bytes, 15
   %aligned = and i64 %plus, -16
   %empty = icmp eq i64 %aligned, 0
   %size = select i1 %empty, i64 16, i64 %aligned
+  %pressure = load i64, ptr @j_gc_pressure
+  %newpressure = add i64 %pressure, %size
+  store i64 %newpressure, ptr @j_gc_pressure
   %left = load i64, ptr @arena_left
   %enough = icmp ule i64 %size, %left
   br i1 %enough, label %allocate, label %map
 map:
-  %large = icmp ugt i64 %size, 16777216
-  %pageplus = add i64 %size, 4095
+  %needed = add i64 %size, 32
+  %large = icmp ugt i64 %needed, 16777216
+  %pageplus = add i64 %needed, 4095
   %pages = and i64 %pageplus, -4096
   %mapsize = select i1 %large, i64 %pages, i64 16777216
   %address = call i64 @mmap(i64 0, i64 %mapsize, i32 3, i32 34, i32 -1, i64 0)
@@ -121,8 +145,17 @@ failure:
   unreachable
 mapped:
   %base = inttoptr i64 %address to ptr
-  store ptr %base, ptr @arena_cursor
-  store i64 %mapsize, ptr @arena_left
+  %previous = load ptr, ptr @arena_block
+  %sizep = getelementptr %ArenaBlock, ptr %base, i32 0, i32 1
+  %usedp = getelementptr %ArenaBlock, ptr %base, i32 0, i32 2
+  %payload = getelementptr i8, ptr %base, i64 32
+  %usable = sub i64 %mapsize, 32
+  store ptr %previous, ptr %base
+  store i64 %mapsize, ptr %sizep
+  store ptr %payload, ptr %usedp
+  store ptr %base, ptr @arena_block
+  store ptr %payload, ptr @arena_cursor
+  store i64 %usable, ptr @arena_left
   br label %allocate
 allocate:
   %cursor = load ptr, ptr @arena_cursor
@@ -131,7 +164,450 @@ allocate:
   %remain = sub i64 %available, %size
   store ptr %next, ptr @arena_cursor
   store i64 %remain, ptr @arena_left
+  %block = load ptr, ptr @arena_block
+  %lastused = getelementptr %ArenaBlock, ptr %block, i32 0, i32 2
+  store ptr %next, ptr %lastused
   ret ptr %cursor
+}
+
+define ptr @j_alloc_permanent(i64 %bytes) {
+entry:
+  %transientblock = load ptr, ptr @arena_block
+  %transientcursor = load ptr, ptr @arena_cursor
+  %transientleft = load i64, ptr @arena_left
+  %block = load ptr, ptr @permanent_block
+  %cursor = load ptr, ptr @permanent_cursor
+  %left = load i64, ptr @permanent_left
+  store ptr %block, ptr @arena_block
+  store ptr %cursor, ptr @arena_cursor
+  store i64 %left, ptr @arena_left
+  %value = call ptr @j_alloc(i64 %bytes)
+  %newblock = load ptr, ptr @arena_block
+  %newcursor = load ptr, ptr @arena_cursor
+  %newleft = load i64, ptr @arena_left
+  store ptr %newblock, ptr @permanent_block
+  store ptr %newcursor, ptr @permanent_cursor
+  store i64 %newleft, ptr @permanent_left
+  store ptr %transientblock, ptr @arena_block
+  store ptr %transientcursor, ptr @arena_cursor
+  store i64 %transientleft, ptr @arena_left
+  ret ptr %value
+}
+
+; Marks are caller-owned 24-byte records, normally on the stack. A rewind
+; invalidates every allocation made after its mark. It is only valid between
+; complete runtime operations, with no suspended state retaining those values.
+define void @j_arena_mark(ptr %mark) {
+entry:
+  %cursorp = getelementptr %ArenaMark, ptr %mark, i32 0, i32 1
+  %remainingp = getelementptr %ArenaMark, ptr %mark, i32 0, i32 2
+  %block = load ptr, ptr @arena_block
+  %cursor = load ptr, ptr @arena_cursor
+  %remaining = load i64, ptr @arena_left
+  store ptr %block, ptr %mark
+  store ptr %cursor, ptr %cursorp
+  store i64 %remaining, ptr %remainingp
+  ret void
+}
+
+define void @j_arena_rewind(ptr %mark) {
+entry:
+  %cursorp = getelementptr %ArenaMark, ptr %mark, i32 0, i32 1
+  %remainingp = getelementptr %ArenaMark, ptr %mark, i32 0, i32 2
+  %target = load ptr, ptr %mark
+  %cursor = load ptr, ptr %cursorp
+  %remaining = load i64, ptr %remainingp
+  %head = load ptr, ptr @arena_block
+  br label %validate
+validate:
+  %checking = phi ptr [ %head, %entry ], [ %checkprevious, %walk ]
+  %found = icmp eq ptr %checking, %target
+  br i1 %found, label %validatecursor, label %checkend
+checkend:
+  %absent = icmp eq ptr %checking, null
+  br i1 %absent, label %invalid, label %walk
+walk:
+  %checkprevious = load ptr, ptr %checking
+  br label %validate
+validatecursor:
+  %empty = icmp eq ptr %target, null
+  br i1 %empty, label %validateempty, label %checkrange
+validateempty:
+  %nullcursor = icmp eq ptr %cursor, null
+  %noremaining = icmp eq i64 %remaining, 0
+  %validempty = and i1 %nullcursor, %noremaining
+  br i1 %validempty, label %release, label %invalid
+checkrange:
+  %sizep = getelementptr %ArenaBlock, ptr %target, i32 0, i32 1
+  %usedp = getelementptr %ArenaBlock, ptr %target, i32 0, i32 2
+  %mapsize = load i64, ptr %sizep
+  %used = load ptr, ptr %usedp
+  %payload = getelementptr i8, ptr %target, i64 32
+  %end = getelementptr i8, ptr %target, i64 %mapsize
+  %afterstart = icmp uge ptr %cursor, %payload
+  %beforeused = icmp ule ptr %cursor, %used
+  %endaddress = ptrtoint ptr %end to i64
+  %cursoraddress = ptrtoint ptr %cursor to i64
+  %expectedremaining = sub i64 %endaddress, %cursoraddress
+  %correctremaining = icmp eq i64 %remaining, %expectedremaining
+  %within = and i1 %afterstart, %beforeused
+  %valid = and i1 %within, %correctremaining
+  br i1 %valid, label %release, label %invalid
+release:
+  br label %freeloop
+freeloop:
+  %block = phi ptr [ %head, %release ], [ %previous, %unmapped ]
+  %atmark = icmp eq ptr %block, %target
+  br i1 %atmark, label %clearcheck, label %unmap
+unmap:
+  %previous = load ptr, ptr %block
+  %lengthp = getelementptr %ArenaBlock, ptr %block, i32 0, i32 1
+  %length = load i64, ptr %lengthp
+  %address = ptrtoint ptr %block to i64
+  %result = call i32 @munmap(i64 %address, i64 %length)
+  %failed = icmp slt i32 %result, 0
+  br i1 %failed, label %fatal, label %unmapped
+unmapped:
+  br label %freeloop
+clearcheck:
+  br i1 %empty, label %restore, label %clear
+clear:
+  %usedfield = getelementptr %ArenaBlock, ptr %target, i32 0, i32 2
+  %oldused = load ptr, ptr %usedfield
+  %usedaddress = ptrtoint ptr %oldused to i64
+  %markedaddress = ptrtoint ptr %cursor to i64
+  %discarded = sub i64 %usedaddress, %markedaddress
+  %cleared = call ptr @memset(ptr %cursor, i32 0, i64 %discarded)
+  store ptr %cursor, ptr %usedfield
+  br label %restore
+restore:
+  store ptr %target, ptr @arena_block
+  store ptr %cursor, ptr @arena_cursor
+  store i64 %remaining, ptr @arena_left
+  store ptr null, ptr @j_parse_error_path
+  store ptr null, ptr @j_parse_error_message
+  store i64 0, ptr @j_parse_error_offset
+  store i1 false, ptr @j_parse_error_eof
+  ret void
+invalid:
+  call void @j_fail(ptr @error_checkpoint)
+  ret void
+fatal:
+  %written = call i64 @write(i32 2, ptr @error_memory, i64 20)
+  call void @_exit(i32 2)
+  unreachable
+}
+
+; A copying collection evacuates only storage newer than the supplied mark.
+; The caller's typed visitor must rewrite its roots before j_gc_end releases
+; the old storage. Permanent allocations and immutable pre-mark graphs stay.
+define void @j_gc_begin(ptr %mark) {
+entry:
+  %active = load i1, ptr @gc_active
+  br i1 %active, label %error, label %begin
+begin:
+  call void @j_arena_mark(ptr @gc_old_state)
+  call void @j_copy(ptr @gc_base_mark, ptr %mark, i64 24)
+  store ptr null, ptr @arena_block
+  store ptr null, ptr @arena_cursor
+  store i64 0, ptr @arena_left
+  store ptr null, ptr @gc_table
+  store i64 0, ptr @gc_capacity
+  store i64 0, ptr @gc_count
+  store i1 true, ptr @gc_active
+  ret void
+error:
+  call void @j_fail(ptr @error_collection)
+  ret void
+}
+
+define internal i1 @gc_movable(ptr %value) {
+entry:
+  %head = load ptr, ptr @gc_old_state
+  %mark = load ptr, ptr @gc_base_mark
+  %cursorp = getelementptr %ArenaMark, ptr @gc_base_mark, i32 0, i32 1
+  %markedcursor = load ptr, ptr %cursorp
+  br label %loop
+loop:
+  %block = phi ptr [ %head, %entry ], [ %previous, %advance ]
+  %end = icmp eq ptr %block, null
+  br i1 %end, label %no, label %range
+range:
+  %atmark = icmp eq ptr %block, %mark
+  %payload = getelementptr i8, ptr %block, i64 32
+  %begin = select i1 %atmark, ptr %markedcursor, ptr %payload
+  %usedp = getelementptr %ArenaBlock, ptr %block, i32 0, i32 2
+  %used = load ptr, ptr %usedp
+  %afterbegin = icmp uge ptr %value, %begin
+  %beforeend = icmp ult ptr %value, %used
+  %inside = and i1 %afterbegin, %beforeend
+  br i1 %inside, label %yes, label %nextcheck
+nextcheck:
+  br i1 %atmark, label %no, label %advance
+advance:
+  %previous = load ptr, ptr %block
+  br label %loop
+yes:
+  ret i1 true
+no:
+  ret i1 false
+}
+
+define internal ptr @gc_slot(ptr %table, i64 %capacity, ptr %key) {
+entry:
+  %address = ptrtoint ptr %key to i64
+  %aligned = lshr i64 %address, 4
+  %mixed = mul i64 %aligned, -7046029254386353131
+  %high = lshr i64 %mixed, 32
+  %hash = xor i64 %mixed, %high
+  %mask = sub i64 %capacity, 1
+  %initial = and i64 %hash, %mask
+  br label %probe
+probe:
+  %index = phi i64 [ %initial, %entry ], [ %next, %advance ]
+  %slotindex = shl i64 %index, 1
+  %slot = getelementptr ptr, ptr %table, i64 %slotindex
+  %stored = load ptr, ptr %slot
+  %empty = icmp eq ptr %stored, null
+  %same = icmp eq ptr %stored, %key
+  %found = or i1 %empty, %same
+  br i1 %found, label %done, label %advance
+advance:
+  %increment = add i64 %index, 1
+  %next = and i64 %increment, %mask
+  br label %probe
+done:
+  ret ptr %slot
+}
+
+define internal void @gc_grow() {
+entry:
+  %old = load ptr, ptr @gc_table
+  %oldcapacity = load i64, ptr @gc_capacity
+  %initial = icmp eq i64 %oldcapacity, 0
+  %twice = shl i64 %oldcapacity, 1
+  %capacity = select i1 %initial, i64 1024, i64 %twice
+  %bytes = mul i64 %capacity, 16
+  %table = call ptr @j_alloc(i64 %bytes)
+  br label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %next, %advance ]
+  %done = icmp eq i64 %i, %oldcapacity
+  br i1 %done, label %finish, label %body
+body:
+  %index = shl i64 %i, 1
+  %slot = getelementptr ptr, ptr %old, i64 %index
+  %key = load ptr, ptr %slot
+  %occupied = icmp ne ptr %key, null
+  br i1 %occupied, label %rehash, label %advance
+rehash:
+  %valuep = getelementptr ptr, ptr %slot, i64 1
+  %value = load ptr, ptr %valuep
+  %newslot = call ptr @gc_slot(ptr %table, i64 %capacity, ptr %key)
+  %newvaluep = getelementptr ptr, ptr %newslot, i64 1
+  store ptr %key, ptr %newslot
+  store ptr %value, ptr %newvaluep
+  br label %advance
+advance:
+  %next = add i64 %i, 1
+  br label %loop
+finish:
+  store ptr %table, ptr @gc_table
+  store i64 %capacity, ptr @gc_capacity
+  ret void
+}
+
+define ptr @j_gc_copy(ptr %old, i64 %bytes, ptr %isnew) {
+entry:
+  store i1 false, ptr %isnew
+  %active = load i1, ptr @gc_active
+  br i1 %active, label %classify, label %error
+classify:
+  %movable = call i1 @gc_movable(ptr %old)
+  br i1 %movable, label %capacitycheck, label %unchanged
+capacitycheck:
+  %capacity = load i64, ptr @gc_capacity
+  %count = load i64, ptr @gc_count
+  %nextcount = add i64 %count, 1
+  %half = lshr i64 %capacity, 1
+  %grow = icmp ugt i64 %nextcount, %half
+  br i1 %grow, label %growth, label %lookup
+growth:
+  call void @gc_grow()
+  br label %lookup
+lookup:
+  %table = load ptr, ptr @gc_table
+  %currentcapacity = load i64, ptr @gc_capacity
+  %slot = call ptr @gc_slot(ptr %table, i64 %currentcapacity, ptr %old)
+  %key = load ptr, ptr %slot
+  %valuep = getelementptr ptr, ptr %slot, i64 1
+  %known = icmp ne ptr %key, null
+  br i1 %known, label %forwarded, label %copy
+forwarded:
+  %forward = load ptr, ptr %valuep
+  ret ptr %forward
+copy:
+  %new = call ptr @j_alloc(i64 %bytes)
+  call void @j_copy(ptr %new, ptr %old, i64 %bytes)
+  store ptr %old, ptr %slot
+  store ptr %new, ptr %valuep
+  store i64 %nextcount, ptr @gc_count
+  store i1 true, ptr %isnew
+  ret ptr %new
+unchanged:
+  ret ptr %old
+error:
+  call void @j_fail(ptr @error_collection)
+  ret ptr %old
+}
+
+; This work queue handles arbitrary JSON graph depth without native recursion.
+; Forwarding is installed before enqueueing, so shared and cyclic graphs are
+; processed only once even when callers construct internal cyclic values.
+define ptr @j_gc_value(ptr %value) {
+entry:
+  %isnew = alloca i1
+  %root = call ptr @j_gc_copy(ptr %value, i64 48, ptr %isnew)
+  %fresh = load i1, ptr %isnew
+  br i1 %fresh, label %begin, label %done
+begin:
+  %queue = call ptr @j_array()
+  call void @j_push(ptr %queue, ptr %value)
+  call void @j_push(ptr %queue, ptr %root)
+  %queuelenp = getelementptr %V, ptr %queue, i32 0, i32 3
+  br label %loop
+loop:
+  %i = phi i64 [ 0, %begin ], [ %next, %advance ]
+  %queuelen = load i64, ptr %queuelenp
+  %finished = icmp uge i64 %i, %queuelen
+  br i1 %finished, label %done, label %body
+body:
+  %old = call ptr @j_at(ptr %queue, i64 %i)
+  %newindex = add i64 %i, 1
+  %new = call ptr @j_at(ptr %queue, i64 %newindex)
+  %tag = load i32, ptr %old
+  switch i32 %tag, label %advance [ i32 3, label %number i32 4, label %string i32 5, label %container i32 6, label %container ]
+number:
+  %oldliteralp = getelementptr %V, ptr %old, i32 0, i32 6
+  %literal = load ptr, ptr %oldliteralp
+  %hasliteral = icmp ne ptr %literal, null
+  br i1 %hasliteral, label %copyliteral, label %advance
+copyliteral:
+  %literallen = call i64 @j_strlen(ptr %literal)
+  %literalbytes = add i64 %literallen, 1
+  %newliteral = call ptr @j_gc_copy(ptr %literal, i64 %literalbytes, ptr %isnew)
+  %newliteralp = getelementptr %V, ptr %new, i32 0, i32 6
+  store ptr %newliteral, ptr %newliteralp
+  br label %advance
+string:
+  %stringlengthp = getelementptr %V, ptr %old, i32 0, i32 3
+  %stringdatap = getelementptr %V, ptr %old, i32 0, i32 5
+  %stringlength = load i64, ptr %stringlengthp
+  %stringdata = load ptr, ptr %stringdatap
+  %stringbytes = add i64 %stringlength, 1
+  %newstringdata = call ptr @j_gc_copy(ptr %stringdata, i64 %stringbytes, ptr %isnew)
+  %newstringdatap = getelementptr %V, ptr %new, i32 0, i32 5
+  store ptr %newstringdata, ptr %newstringdatap
+  br label %advance
+container:
+  %lengthp = getelementptr %V, ptr %old, i32 0, i32 3
+  %capacityp = getelementptr %V, ptr %old, i32 0, i32 4
+  %datap = getelementptr %V, ptr %old, i32 0, i32 5
+  %length = load i64, ptr %lengthp
+  %capacity = load i64, ptr %capacityp
+  %data = load ptr, ptr %datap
+  %object = icmp eq i32 %tag, 6
+  %width = select i1 %object, i64 2, i64 1
+  %slots = mul i64 %length, %width
+  %allocatedslots = mul i64 %capacity, %width
+  %bytes = mul i64 %allocatedslots, 8
+  %newdata = call ptr @j_gc_copy(ptr %data, i64 %bytes, ptr %isnew)
+  %newdatap = getelementptr %V, ptr %new, i32 0, i32 5
+  store ptr %newdata, ptr %newdatap
+  br label %children
+children:
+  %j = phi i64 [ 0, %container ], [ %nextchild, %childnext ]
+  %lastchild = icmp eq i64 %j, %slots
+  br i1 %lastchild, label %advance, label %child
+child:
+  %oldslot = getelementptr ptr, ptr %data, i64 %j
+  %newslot = getelementptr ptr, ptr %newdata, i64 %j
+  %oldchild = load ptr, ptr %oldslot
+  %newchild = call ptr @j_gc_copy(ptr %oldchild, i64 48, ptr %isnew)
+  store ptr %newchild, ptr %newslot
+  %childfresh = load i1, ptr %isnew
+  br i1 %childfresh, label %enqueue, label %childnext
+enqueue:
+  call void @j_push(ptr %queue, ptr %oldchild)
+  call void @j_push(ptr %queue, ptr %newchild)
+  br label %childnext
+childnext:
+  %nextchild = add i64 %j, 1
+  br label %children
+advance:
+  %next = add i64 %i, 2
+  br label %loop
+done:
+  ret ptr %root
+}
+
+define void @j_gc_end(ptr %mark) {
+entry:
+  %active = load i1, ptr @gc_active
+  br i1 %active, label %validate, label %error
+validate:
+  %markcursorp = getelementptr %ArenaMark, ptr %mark, i32 0, i32 1
+  %markleftp = getelementptr %ArenaMark, ptr %mark, i32 0, i32 2
+  %basecursorp = getelementptr %ArenaMark, ptr @gc_base_mark, i32 0, i32 1
+  %baseleftp = getelementptr %ArenaMark, ptr @gc_base_mark, i32 0, i32 2
+  %markblock = load ptr, ptr %mark
+  %markcursor = load ptr, ptr %markcursorp
+  %markleft = load i64, ptr %markleftp
+  %baseblock = load ptr, ptr @gc_base_mark
+  %basecursor = load ptr, ptr %basecursorp
+  %baseleft = load i64, ptr %baseleftp
+  %sameblock = icmp eq ptr %markblock, %baseblock
+  %samecursor = icmp eq ptr %markcursor, %basecursor
+  %sameleft = icmp eq i64 %markleft, %baseleft
+  %sameplace = and i1 %sameblock, %samecursor
+  %same = and i1 %sameplace, %sameleft
+  br i1 %same, label %prepare, label %error
+prepare:
+  %newhead = load ptr, ptr @arena_block
+  %newcursor = load ptr, ptr @arena_cursor
+  %newleft = load i64, ptr @arena_left
+  %oldcursorp = getelementptr %ArenaMark, ptr @gc_old_state, i32 0, i32 1
+  %oldleftp = getelementptr %ArenaMark, ptr @gc_old_state, i32 0, i32 2
+  %oldhead = load ptr, ptr @gc_old_state
+  %oldcursor = load ptr, ptr %oldcursorp
+  %oldleft = load i64, ptr %oldleftp
+  store ptr %oldhead, ptr @arena_block
+  store ptr %oldcursor, ptr @arena_cursor
+  store i64 %oldleft, ptr @arena_left
+  call void @j_arena_rewind(ptr @gc_base_mark)
+  %newempty = icmp eq ptr %newhead, null
+  br i1 %newempty, label %finish, label %tail
+tail:
+  %block = phi ptr [ %newhead, %prepare ], [ %previous, %tail ]
+  %previous = load ptr, ptr %block
+  %last = icmp eq ptr %previous, null
+  br i1 %last, label %attach, label %tail
+attach:
+  store ptr %baseblock, ptr %block
+  store ptr %newhead, ptr @arena_block
+  store ptr %newcursor, ptr @arena_cursor
+  store i64 %newleft, ptr @arena_left
+  br label %finish
+finish:
+  store i1 false, ptr @gc_active
+  store i64 0, ptr @j_gc_pressure
+  store ptr null, ptr @gc_table
+  store i64 0, ptr @gc_capacity
+  store i64 0, ptr @gc_count
+  ret void
+error:
+  call void @j_fail(ptr @error_collection)
+  ret void
 }
 
 define void @j_copy(ptr %dest, ptr %source, i64 %length) noinline optnone {
@@ -1076,7 +1552,6 @@ digitstart:
   br label %digits
 digits:
   %i = phi i64 [ %begin, %digitstart ], [ %next, %append ], [ %dotnext, %dot ]
-  %fraction = phi i32 [ 0, %digitstart ], [ %newfraction, %append ], [ %fraction, %dot ]
   %decimal = phi i1 [ false, %digitstart ], [ %decimal, %append ], [ true, %dot ]
   %seen = phi i1 [ false, %digitstart ], [ true, %append ], [ %seen, %dot ]
   %end = icmp uge i64 %i, %length
@@ -1088,8 +1563,6 @@ digitbody:
   %digit = icmp ult i8 %d, 10
   br i1 %digit, label %append, label %nondigit
 append:
-  %decremented = sub i32 %fraction, 1
-  %newfraction = select i1 %decimal, i32 %decremented, i32 %fraction
   %next = add i64 %i, 1
   br label %digits
 nondigit:
@@ -1126,7 +1599,6 @@ exponentsign:
   br label %exploop
 exploop:
   %ei = phi i64 [ %ebegin, %exponentsign ], [ %einext, %expappend ]
-  %exponent = phi i32 [ 0, %exponentsign ], [ %expsum, %expappend ]
   %eend = icmp uge i64 %ei, %length
   br i1 %eend, label %expend, label %expbody
 expbody:
@@ -1136,34 +1608,23 @@ expbody:
   %edigit = icmp ult i8 %ed, 10
   br i1 %edigit, label %expappend, label %expend
 expappend:
-  %edi = zext i8 %ed to i32
-  %exptimes = mul i32 %exponent, 10
-  %expadded = add i32 %exptimes, %edi
-  %excessive = icmp ugt i32 %expadded, 100000
-  %expsum = select i1 %excessive, i32 100000, i32 %expadded
   %einext = add i64 %ei, 1
   br label %exploop
 expend:
   %noexpdigits = icmp eq i64 %ei, %ebegin
   br i1 %noexpdigits, label %error, label %expvalid
 expvalid:
-  %negexp = sub i32 0, %exponent
-  %signedexp = select i1 %enegative, i32 %negexp, i32 %exponent
   br label %calculate
 noexponent:
   br label %calculate
 calculate:
   %stop = phi i64 [ %i, %noexponent ], [ %ei, %expvalid ]
-  %expvalue = phi i32 [ 0, %noexponent ], [ %signedexp, %expvalid ]
-  %totalexp = add i32 %expvalue, %fraction
-  %scaled = call double @decimal_binary64(ptr %data, i64 %begin, i64 %i, i32 %totalexp)
-  %negated = fneg double %scaled
-  %signednumber = select i1 %negative, double %negated, double %scaled
-  %v = call ptr @j_num(double %signednumber)
   %literal_length = sub i64 %stop, %start
   %literal_value = call ptr @j_str(ptr %sp, i64 %literal_length)
   %ldp = getelementptr %V, ptr %literal_value, i32 0, i32 5
   %literal = load ptr, ptr %ldp
+  %signednumber = call double @j_decimal_to_double(ptr %literal)
+  %v = call ptr @j_num(double %signednumber)
   %lp = getelementptr %V, ptr %v, i32 0, i32 6
   store ptr %literal, ptr %lp
   store i64 %stop, ptr %offset
@@ -1742,6 +2203,215 @@ finish:
   ret i32 %length
 }
 
+; Compare a normalized decimal with an exact binary coefficient. Binary
+; digits are little-endian base ten; decimal input digits are ASCII forward.
+define internal i32 @decimal_compare_digits(ptr %parts, ptr %binarydigits, i64 %binarylength, i64 %binaryposition) {
+entry:
+  %positionp = getelementptr %Decimal, ptr %parts, i32 0, i32 3
+  %position = load i64, ptr %positionp
+  %sameposition = icmp eq i64 %position, %binaryposition
+  br i1 %sameposition, label %digits, label %positionorder
+positionorder:
+  %lessposition = icmp slt i64 %position, %binaryposition
+  %positionresult = select i1 %lessposition, i32 -1, i32 1
+  ret i32 %positionresult
+digits:
+  %lengthp = getelementptr %Decimal, ptr %parts, i32 0, i32 2
+  %datap = getelementptr %Decimal, ptr %parts, i32 0, i32 4
+  %length = load i64, ptr %lengthp
+  %data = load ptr, ptr %datap
+  %longer = icmp ugt i64 %length, %binarylength
+  %count = select i1 %longer, i64 %length, i64 %binarylength
+  br label %loop
+loop:
+  %i = phi i64 [ 0, %digits ], [ %next, %equalbyte ]
+  %done = icmp eq i64 %i, %count
+  br i1 %done, label %equal, label %leftcheck
+leftcheck:
+  %hasleft = icmp ult i64 %i, %length
+  br i1 %hasleft, label %left, label %leftzero
+left:
+  %lp = getelementptr i8, ptr %data, i64 %i
+  %ascii = load i8, ptr %lp
+  %digit = sub i8 %ascii, 48
+  br label %rightcheck
+leftzero:
+  br label %rightcheck
+rightcheck:
+  %a = phi i8 [ %digit, %left ], [ 0, %leftzero ]
+  %hasright = icmp ult i64 %i, %binarylength
+  br i1 %hasright, label %right, label %rightzero
+right:
+  %reverse = sub i64 %binarylength, %i
+  %index = sub i64 %reverse, 1
+  %rp = getelementptr i8, ptr %binarydigits, i64 %index
+  %binarydigit = load i8, ptr %rp
+  br label %compare
+rightzero:
+  br label %compare
+compare:
+  %b = phi i8 [ %binarydigit, %right ], [ 0, %rightzero ]
+  %same = icmp eq i8 %a, %b
+  br i1 %same, label %equalbyte, label %different
+equalbyte:
+  %next = add i64 %i, 1
+  br label %loop
+different:
+  %less = icmp ult i8 %a, %b
+  %result = select i1 %less, i32 -1, i32 1
+  ret i32 %result
+equal:
+  ret i32 0
+}
+
+; The upper boundary of binary64 x is (2*m+1)*2^(e-1). This expression
+; also describes the zero/subnormal boundary and the overflow threshold.
+define internal i32 @decimal_upper(ptr %digits, ptr %positionout, i64 %bits) {
+entry:
+  %fraction = and i64 %bits, 4503599627370495
+  %encoded64 = lshr i64 %bits, 52
+  %encoded = trunc i64 %encoded64 to i32
+  %subnormal = icmp eq i32 %encoded, 0
+  %normalized = or i64 %fraction, 4503599627370496
+  %mantissa = select i1 %subnormal, i64 %fraction, i64 %normalized
+  %normalexponent = sub i32 %encoded, 1075
+  %exponent = select i1 %subnormal, i32 -1074, i32 %normalexponent
+  %twice = shl i64 %mantissa, 1
+  %middle = add i64 %twice, 1
+  %middleexponent = sub i32 %exponent, 1
+  %length = call i32 @decimal_coefficient(ptr %digits, i64 %middle, i32 %middleexponent)
+  %negative = icmp slt i32 %middleexponent, 0
+  %decimalexponent = select i1 %negative, i32 %middleexponent, i32 0
+  %position32 = add i32 %length, %decimalexponent
+  %position = sext i32 %position32 to i64
+  store i64 %position, ptr %positionout
+  ret i32 %length
+}
+
+define internal i32 @decimal_compare_upper(ptr %parts, i64 %bits) noinline {
+entry:
+  %digits = alloca [1100 x i8]
+  %positionout = alloca i64
+  %length32 = call i32 @decimal_upper(ptr %digits, ptr %positionout, i64 %bits)
+  %length = zext i32 %length32 to i64
+  %position = load i64, ptr %positionout
+  %result = call i32 @decimal_compare_digits(ptr %parts, ptr %digits, i64 %length, i64 %position)
+  ret i32 %result
+}
+
+define double @j_decimal_to_double(ptr %literal) {
+entry:
+  %first = load i8, ptr %literal
+  %negative = icmp eq i8 %first, 45
+  %parts = call ptr @decimal_parts(ptr %literal)
+  %lengthp = getelementptr %Decimal, ptr %parts, i32 0, i32 2
+  %positionp = getelementptr %Decimal, ptr %parts, i32 0, i32 3
+  %datap = getelementptr %Decimal, ptr %parts, i32 0, i32 4
+  %length = load i64, ptr %lengthp
+  %position = load i64, ptr %positionp
+  %data = load ptr, ptr %datap
+  %zero = icmp eq i64 %length, 0
+  br i1 %zero, label %zeroresult, label %range
+range:
+  %large = icmp sgt i64 %position, 309
+  br i1 %large, label %infinity, label %tinycheck
+tinycheck:
+  %tiny = icmp slt i64 %position, -323
+  br i1 %tiny, label %zeroresult, label %approximate
+approximate:
+  %exponent64 = sub i64 %position, %length
+  %exponent = trunc i64 %exponent64 to i32
+  %approximation = call double @decimal_binary64(ptr %data, i64 0, i64 %length, i32 %exponent)
+  %approximatebits = bitcast double %approximation to i64
+  %short = icmp ule i64 %length, 15
+  %low = icmp sge i64 %exponent64, -22
+  %high = icmp sle i64 %exponent64, 22
+  %smallscale = and i1 %low, %high
+  %clinger = and i1 %short, %smallscale
+  %integer = icmp eq i64 %exponent64, 0
+  %word = icmp ule i64 %length, 19
+  %wordinteger = and i1 %integer, %word
+  %exactfast = or i1 %clinger, %wordinteger
+  br i1 %exactfast, label %fastresult, label %correct
+fastresult:
+  br label %sign
+correct:
+  %bits = phi i64 [ %approximatebits, %approximate ], [ %higher, %increment ], [ %lower, %decrement ]
+  %steps = phi i32 [ 0, %approximate ], [ %nextstep, %increment ], [ %nextstep, %decrement ]
+  %nextstep = add i32 %steps, 1
+  %many = icmp eq i32 %steps, 8
+  br i1 %many, label %binarysearch, label %uppercheck
+uppercheck:
+  %isinf = icmp eq i64 %bits, 9218868437227405312
+  br i1 %isinf, label %lowercheck, label %upper
+upper:
+  %uppercmp = call i32 @decimal_compare_upper(ptr %parts, i64 %bits)
+  %above = icmp sgt i32 %uppercmp, 0
+  %atequal = icmp eq i32 %uppercmp, 0
+  %parity = and i64 %bits, 1
+  %odd = icmp ne i64 %parity, 0
+  %tieup = and i1 %atequal, %odd
+  %needup = or i1 %above, %tieup
+  br i1 %needup, label %increment, label %lowercheck
+increment:
+  %higher = add i64 %bits, 1
+  br label %correct
+lowercheck:
+  %iszero = icmp eq i64 %bits, 0
+  br i1 %iszero, label %correctresult, label %lowerbound
+lowerbound:
+  %previousbits = sub i64 %bits, 1
+  %lowercmp = call i32 @decimal_compare_upper(ptr %parts, i64 %previousbits)
+  %below = icmp slt i32 %lowercmp, 0
+  %lowerequal = icmp eq i32 %lowercmp, 0
+  %lowerparity = and i64 %bits, 1
+  %lowerodd = icmp ne i64 %lowerparity, 0
+  %tiedown = and i1 %lowerequal, %lowerodd
+  %needdown = or i1 %below, %tiedown
+  br i1 %needdown, label %decrement, label %correctresult
+decrement:
+  %lower = sub i64 %bits, 1
+  br label %correct
+correctresult:
+  br label %sign
+binarysearch:
+  br label %search
+search:
+  %lo = phi i64 [ 0, %binarysearch ], [ %newlo, %moveup ], [ %lo, %movedown ]
+  %hi = phi i64 [ 9218868437227405312, %binarysearch ], [ %hi, %moveup ], [ %midpoint, %movedown ]
+  %finished = icmp eq i64 %lo, %hi
+  br i1 %finished, label %searchresult, label %searchbody
+searchbody:
+  %distance = sub i64 %hi, %lo
+  %half = lshr i64 %distance, 1
+  %midpoint = add i64 %lo, %half
+  %comparison = call i32 @decimal_compare_upper(ptr %parts, i64 %midpoint)
+  %greater = icmp sgt i32 %comparison, 0
+  %equal = icmp eq i32 %comparison, 0
+  %midparity = and i64 %midpoint, 1
+  %midodd = icmp ne i64 %midparity, 0
+  %midtie = and i1 %equal, %midodd
+  %after = or i1 %greater, %midtie
+  br i1 %after, label %moveup, label %movedown
+moveup:
+  %newlo = add i64 %midpoint, 1
+  br label %search
+movedown:
+  br label %search
+searchresult:
+  br label %sign
+zeroresult:
+  br label %sign
+infinity:
+  br label %sign
+sign:
+  %unsignedbits = phi i64 [ 0, %zeroresult ], [ 9218868437227405312, %infinity ], [ %approximatebits, %fastresult ], [ %bits, %correctresult ], [ %lo, %searchresult ]
+  %signbit = select i1 %negative, i64 -9223372036854775808, i64 0
+  %signedbits = or i64 %unsignedbits, %signbit
+  %result = bitcast i64 %signedbits to double
+  ret double %result
+}
+
 define internal i64 @decimal_round(ptr %digits, i32 %length, i32 %precision) {
 entry:
   %short = icmp ult i32 %length, %precision
@@ -1798,6 +2468,69 @@ down:
   ret i64 %m
 }
 
+; A candidate decimal is admissible exactly when it lies between adjacent
+; binary midpoints, including ties only for an even binary significand.
+define internal i1 @decimal_candidate(i64 %coefficient, i32 %exponent, ptr %interval) {
+entry:
+  %zero = icmp eq i64 %coefficient, 0
+  br i1 %zero, label %no, label %start
+start:
+  %digits = alloca [24 x i8]
+  %parts = alloca %Decimal
+  br label %loop
+loop:
+  %value = phi i64 [ %coefficient, %start ], [ %quotient, %loop ]
+  %length = phi i64 [ 0, %start ], [ %nextlength, %loop ]
+  %remainder = urem i64 %value, 10
+  %digit = trunc i64 %remainder to i8
+  %ascii = add i8 %digit, 48
+  %index = sub i64 23, %length
+  %p = getelementptr i8, ptr %digits, i64 %index
+  store i8 %ascii, ptr %p
+  %nextlength = add i64 %length, 1
+  %quotient = udiv i64 %value, 10
+  %finished = icmp eq i64 %quotient, 0
+  br i1 %finished, label %prepare, label %loop
+prepare:
+  %lp = getelementptr %Decimal, ptr %parts, i32 0, i32 2
+  %xp = getelementptr %Decimal, ptr %parts, i32 0, i32 3
+  %dp = getelementptr %Decimal, ptr %parts, i32 0, i32 4
+  %exp64 = sext i32 %exponent to i64
+  %position = add i64 %nextlength, %exp64
+  store i64 %nextlength, ptr %lp
+  store i64 %position, ptr %xp
+  store ptr %p, ptr %dp
+  %lowerp = getelementptr %RoundInterval, ptr %interval, i32 0, i32 0
+  %upperp = getelementptr %RoundInterval, ptr %interval, i32 0, i32 1
+  %lowerlp = getelementptr %RoundInterval, ptr %interval, i32 0, i32 2
+  %upperlp = getelementptr %RoundInterval, ptr %interval, i32 0, i32 3
+  %lowerxp = getelementptr %RoundInterval, ptr %interval, i32 0, i32 4
+  %upperxp = getelementptr %RoundInterval, ptr %interval, i32 0, i32 5
+  %evenp = getelementptr %RoundInterval, ptr %interval, i32 0, i32 6
+  %lower = load ptr, ptr %lowerp
+  %upper = load ptr, ptr %upperp
+  %lowerlength = load i64, ptr %lowerlp
+  %upperlength = load i64, ptr %upperlp
+  %lowerposition = load i64, ptr %lowerxp
+  %upperposition = load i64, ptr %upperxp
+  %even = load i1, ptr %evenp
+  %lowercmp = call i32 @decimal_compare_digits(ptr %parts, ptr %lower, i64 %lowerlength, i64 %lowerposition)
+  %lowerinside = icmp sgt i32 %lowercmp, 0
+  %lowerequal = icmp eq i32 %lowercmp, 0
+  %lowertie = and i1 %lowerequal, %even
+  %lowerok = or i1 %lowerinside, %lowertie
+  br i1 %lowerok, label %uppercheck, label %no
+uppercheck:
+  %uppercmp = call i32 @decimal_compare_digits(ptr %parts, ptr %upper, i64 %upperlength, i64 %upperposition)
+  %upperinside = icmp slt i32 %uppercmp, 0
+  %upperequal = icmp eq i32 %uppercmp, 0
+  %uppertie = and i1 %upperequal, %even
+  %upperok = or i1 %upperinside, %uppertie
+  ret i1 %upperok
+no:
+  ret i1 false
+}
+
 define internal void @dump_number(ptr %b, double %number) {
 entry:
   %bits = bitcast double %number to i64
@@ -1823,6 +2556,17 @@ finite:
   %infinite = icmp eq i64 %absbits, 9218868437227405312
   %finitebits = select i1 %infinite, i64 9218868437227405311, i64 %absbits
   %absolute = bitcast i64 %finitebits to double
+  %smallinteger = fcmp ole double %absolute, 9.007199254740992e15
+  br i1 %smallinteger, label %integercheck, label %expansion
+integercheck:
+  %wholevalue = fptoui double %absolute to i64
+  %integerpart = uitofp i64 %wholevalue to double
+  %integer = fcmp oeq double %integerpart, %absolute
+  br i1 %integer, label %whole, label %expansion
+whole:
+  call void @buffer_uint(ptr %b, i64 %wholevalue)
+  ret void
+expansion:
   %frac = and i64 %finitebits, 4503599627370495
   %expshift = lshr i64 %finitebits, 52
   %expbits = trunc i64 %expshift to i32
@@ -1836,31 +2580,54 @@ finite:
   %negexp = icmp slt i32 %exp2, 0
   %decimalexp = select i1 %negexp, i32 %exp2, i32 0
   %expplus = add i32 %decimalexp, %length
+  %lowerdigits = alloca [1100 x i8]
+  %upperdigits = alloca [1100 x i8]
+  %interval = alloca %RoundInterval
+  %lowerp = getelementptr %RoundInterval, ptr %interval, i32 0, i32 0
+  %upperp = getelementptr %RoundInterval, ptr %interval, i32 0, i32 1
+  %lowerlp = getelementptr %RoundInterval, ptr %interval, i32 0, i32 2
+  %upperlp = getelementptr %RoundInterval, ptr %interval, i32 0, i32 3
+  %lowerxp = getelementptr %RoundInterval, ptr %interval, i32 0, i32 4
+  %upperxp = getelementptr %RoundInterval, ptr %interval, i32 0, i32 5
+  %evenp = getelementptr %RoundInterval, ptr %interval, i32 0, i32 6
+  %previousbits = sub i64 %finitebits, 1
+  %lowerlength32 = call i32 @decimal_upper(ptr %lowerdigits, ptr %lowerxp, i64 %previousbits)
+  %upperlength32 = call i32 @decimal_upper(ptr %upperdigits, ptr %upperxp, i64 %finitebits)
+  %lowerlength = zext i32 %lowerlength32 to i64
+  %upperlength = zext i32 %upperlength32 to i64
+  %lowbit = and i64 %finitebits, 1
+  %even = icmp eq i64 %lowbit, 0
+  store ptr %lowerdigits, ptr %lowerp
+  store ptr %upperdigits, ptr %upperp
+  store i64 %lowerlength, ptr %lowerlp
+  store i64 %upperlength, ptr %upperlp
+  store i1 %even, ptr %evenp
   br label %precision
 precision:
-  %n = phi i32 [ 1, %finite ], [ %nn, %trymore ]
+  %n = phi i32 [ 1, %expansion ], [ %nn, %trymore ]
   %short = icmp ult i32 %length, %n
   %used = select i1 %short, i32 %length, i32 %n
   %m = call i64 @decimal_round(ptr %digits, i32 %length, i32 %n)
   %scale = sub i32 %expplus, %used
-  %scaleisneg = icmp slt i32 %scale, 0
-  %negscale = sub i32 0, %scale
-  %absscale = select i1 %scaleisneg, i32 %negscale, i32 %scale
-  %power = call double @j_pow10(i32 %absscale)
-  %md = uitofp i64 %m to double
-  %up = fmul double %md, %power
-  %down = fdiv double %md, %power
-  %candidate = select i1 %scaleisneg, double %down, double %up
-  %matches = fcmp oeq double %candidate, %absolute
-  %last = icmp eq i32 %n, 17
-  %take = or i1 %matches, %last
-  br i1 %take, label %trim, label %trymore
+  %matches = call i1 @decimal_candidate(i64 %m, i32 %scale, ptr %interval)
+  br i1 %matches, label %choose, label %trylower
+trylower:
+  %below = sub i64 %m, 1
+  %lowermatches = call i1 @decimal_candidate(i64 %below, i32 %scale, ptr %interval)
+  br i1 %lowermatches, label %choose, label %tryupper
+tryupper:
+  %above = add i64 %m, 1
+  %uppermatches = call i1 @decimal_candidate(i64 %above, i32 %scale, ptr %interval)
+  br i1 %uppermatches, label %choose, label %trymore
 trymore:
   %nn = add i32 %n, 1
   br label %precision
+choose:
+  %chosen = phi i64 [ %m, %precision ], [ %below, %trylower ], [ %above, %tryupper ]
+  br label %trim
 trim:
-  %coefficient = phi i64 [ %m, %precision ], [ %divided, %trimzero ]
-  %power10 = phi i32 [ %scale, %precision ], [ %increased, %trimzero ]
+  %coefficient = phi i64 [ %chosen, %choose ], [ %divided, %trimzero ]
+  %power10 = phi i32 [ %scale, %choose ], [ %increased, %trimzero ]
   %rem = urem i64 %coefficient, 10
   %trailingzero = icmp eq i64 %rem, 0
   br i1 %trailingzero, label %trimzero, label %coefficientstart

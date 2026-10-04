@@ -10,6 +10,12 @@
 @j_compile_error_raw = global i1 false
 @j_compile_errors = global ptr null
 @ev_compile_depth = internal global i64 0
+@ev_source_filename = internal global ptr null
+@ev_validation_active = internal global i1 false
+@ev_validation_bindings = internal global ptr null
+@ev_validation_rootframe = internal global ptr null
+@ev_validation_frame = internal global ptr null
+@ev_validation_module = internal global ptr null
 @ev_syntax = private constant [14 x i8] c"syntax error\00\00"
 @ev_undefined = private constant [25 x i8] c"Unknown function or name\00"
 @ev_iteration = private constant [26 x i8] c"Cannot iterate over value\00"
@@ -53,6 +59,14 @@
 @ev_topfile = private constant [12 x i8] c"<top-level>\00"
 @j_library_paths = external global ptr
 declare ptr @j_read_file(ptr)
+declare ptr @j_home_ast(ptr)
+declare ptr @j_fs_canonical(ptr)
+declare ptr @j_fs_dirname(ptr)
+declare i1 @j_fs_exists(ptr)
+declare i1 @j_fs_validate_module(ptr)
+declare ptr @j_fs_search(ptr, ptr)
+declare ptr @j_compile_file_diagnostic(ptr, i64, i64, i64, ptr, ptr)
+@j_fs_search_error = external global ptr
 
 declare ptr @j_alloc(i64)
 declare ptr @j_null()
@@ -82,8 +96,10 @@ declare ptr @j_pick(ptr, ptr, ptr)
 declare ptr @b_delete_many(ptr, ptr)
 declare ptr @j_builtin_take(ptr, ptr, ptr, ptr, i64)
 declare i1 @b_known(ptr, i64)
+declare ptr @j_eval(ptr, ptr, ptr)
+declare ptr @j_eval_take(ptr, ptr, ptr, i64)
 
-define internal ptr @ev_node(i32 %kind, i32 %op, ptr %a, ptr %b, ptr %c, ptr %d) {
+define ptr @ev_node(i32 %kind, i32 %op, ptr %a, ptr %b, ptr %c, ptr %d) {
 entry:
   %n = call ptr @j_alloc(i64 64)
   store i32 %kind, ptr %n
@@ -1329,8 +1345,6 @@ defparamnext:
   br label %defparams
 defparamclose:
   call void @ev_expect(ptr %p, i32 41)
-  %def.parametercount = call i64 @ev_len(ptr %def.params)
-  call void @ev_functionlimit(i64 %def.parametercount)
   br label %defbody
 defbody:
   call void @ev_expect(ptr %p, i32 58)
@@ -1559,13 +1573,26 @@ good:
   br i1 %toplevel, label %validate, label %returngood
 validate:
   %environment = load ptr, ptr @j_compile_env
-  call void @ev_validate(ptr %ast, ptr %environment)
+  %mainast = call ptr @j_home_ast(ptr %ast)
+  %validationframe = call ptr @j_alloc(i64 8)
+  store ptr %validationframe, ptr @ev_validation_rootframe
+  store ptr %validationframe, ptr @ev_validation_frame
+  store ptr null, ptr @ev_validation_module
+  store ptr null, ptr @ev_validation_bindings
+  store i1 true, ptr @ev_validation_active
+  call void @ev_validate(ptr %mainast, ptr %environment)
+  store i1 false, ptr @ev_validation_active
+  store ptr null, ptr @ev_validation_rootframe
+  store ptr null, ptr @ev_validation_frame
+  store ptr null, ptr @ev_validation_module
+  store ptr null, ptr @ev_validation_bindings
   %validationerror = load ptr, ptr @j_error
   %valid = icmp eq ptr %validationerror, null
   br i1 %valid, label %returngood, label %returnerror
 returngood:
+  %result = phi ptr [%ast, %good], [%mainast, %validate]
   store i64 %depth, ptr @ev_compile_depth
-  ret ptr %ast
+  ret ptr %result
 bad:
   br i1 %globalfree, label %seterror, label %returnerror
 seterror:
@@ -1590,7 +1617,7 @@ entry:
   ret ptr %e
 }
 
-define internal ptr @ev_lookup(ptr %env, ptr %name, i32 %type, i64 %arity) {
+define ptr @ev_lookup(ptr %env, ptr %name, i32 %type, i64 %arity) {
 entry:
   br label %loop
 loop:
@@ -1625,7 +1652,7 @@ missing:
   ret ptr null
 }
 
-define internal ptr @ev_bindpattern(ptr %env, ptr %pattern, ptr %value, ptr %input) {
+define ptr @ev_bindpattern(ptr %env, ptr %pattern, ptr %value, ptr %input) {
 entry:
   %kind = load i32, ptr %pattern
   %ap = getelementptr %N, ptr %pattern, i32 0, i32 2
@@ -1734,7 +1761,7 @@ done:
   ret ptr %node
 }
 
-define internal ptr @ev_patternnull(ptr %node, ptr %env) {
+define ptr @ev_patternnull(ptr %node, ptr %env) {
 entry:
   %kind = load i32, ptr %node
   %ap = getelementptr %N, ptr %node, i32 0, i32 2
@@ -2051,7 +2078,7 @@ done:
   ret i64 %i
 }
 
-define internal ptr @ev_slice(ptr %value, ptr %startval, ptr %endval) {
+define ptr @ev_slice(ptr %value, ptr %startval, ptr %endval) {
 entry:
   %tag = load i32, ptr %value
   %isnull = icmp eq i32 %tag, 0
@@ -2119,11 +2146,11 @@ done:
   ret ptr %out
 }
 
-@ev_break_name = internal global ptr null
+@ev_break_name = global ptr null
 @ev_invalid_path_value = internal global ptr null
 @ev_invalid_path_detailed = internal global i1 false
 
-define ptr @j_eval(ptr %node, ptr %input, ptr %env) {
+define ptr @j_eval_atom(ptr %node, ptr %input, ptr %env) {
 entry:
   %out = call ptr @j_array()
   %noast = icmp eq ptr %node, null
@@ -2290,6 +2317,9 @@ iternext:
   br label %iterloop
 call:
   %arity = call i64 @ev_len(ptr %b)
+  %privatebuiltin = icmp sle i32 %op, -2
+  br i1 %privatebuiltin, label %specialcheck, label %userlookup
+userlookup:
   %function = call ptr @ev_lookup(ptr %env, ptr %a, i32 1, i64 %arity)
   %foundfunction = icmp ne ptr %function, null
   br i1 %foundfunction, label %usercall, label %filterlookup
@@ -2662,7 +2692,7 @@ done:
   ret void
 }
 
-define ptr @j_eval_take(ptr %node, ptr %input, ptr %env, i64 %count) {
+define ptr @j_eval_take_eager(ptr %node, ptr %input, ptr %env, i64 %count) {
 entry:
   %out = call ptr @j_array()
   %empty = icmp eq i64 %count, 0
@@ -2782,7 +2812,10 @@ done:
   %num = uitofp i64 %number to double
   %lineno = call ptr @j_num(double %num)
   %location = call ptr @j_object()
-  %filename = call ptr @j_cstr(ptr @ev_topfile)
+  %topfile = call ptr @j_cstr(ptr @ev_topfile)
+  %modulefile = load ptr, ptr @ev_source_filename
+  %hasmodule = icmp ne ptr %modulefile, null
+  %filename = select i1 %hasmodule, ptr %modulefile, ptr %topfile
   %filekey = call ptr @j_cstr(ptr @ev_filekey)
   %linekey = call ptr @j_cstr(ptr @ev_linekey)
   call void @j_put(ptr %location, ptr %filekey, ptr %filename)
@@ -2847,7 +2880,7 @@ no:
 @ev_openparen = private constant [3 x i8] c" (\00"
 @ev_closeparen = private constant [2 x i8] c")\00"
 
-define internal void @ev_itererror(ptr %value) {
+define void @ev_itererror(ptr %value) {
 entry:
   %tag = load i32, ptr %value
   %isnum = icmp eq i32 %tag, 3
@@ -3569,7 +3602,7 @@ updateskip:
   br label %updatenext
 updateeval:
   %rhsinput = select i1 %pureupdate, ptr %old, ptr %input
-  %updates = call ptr @j_eval(ptr %rhs, ptr %rhsinput, ptr %env)
+  %updates = call ptr @j_eval_take(ptr %rhs, ptr %rhsinput, ptr %env, i64 1)
   %un = call i64 @ev_len(ptr %updates)
   %empty = icmp eq i64 %un, 0
   br i1 %empty, label %updatedelete, label %updateset
@@ -3602,9 +3635,10 @@ done:
   ret ptr %out
 }
 
-@ev_module_directory = internal global ptr null
+@ev_module_directory = global ptr null
 @ev_module_depth = internal global i64 0
 @ev_module_stack = internal global ptr null
+@ev_module_cache = global ptr null
 @ev_circularimport = private constant [25 x i8] c"circular import detected\00"
 @ev_searchkey = private constant [7 x i8] c"search\00"
 @ev_slash = private constant [2 x i8] c"/\00"
@@ -3623,6 +3657,13 @@ done:
 @ev_askey = private constant [3 x i8] c"as\00"
 @ev_datakey = private constant [8 x i8] c"is_data\00"
 @ev_relpathkey = private constant [8 x i8] c"relpath\00"
+@ev_jqmain = private constant [8 x i8] c"jq/main\00"
+@ev_missingprefix = private constant [19 x i8] c"module not found: \00"
+@ev_cycleprefix = private constant [20 x i8] c"circular import of \00"
+@ev_openparenthesis = private constant [3 x i8] c" (\00"
+@ev_closeparenthesis = private constant [2 x i8] c")\00"
+@ev_optionalkey = private constant [9 x i8] c"optional\00"
+@ev_rawkey = private constant [4 x i8] c"raw\00"
 @ev_keyparentheses = private constant [54 x i8] c"May need parentheses around object key expression\00\00\00\00\00"
 @ev_cannotuse = private constant [12 x i8] c"Cannot use \00"
 @ev_asobjectkey = private constant [16 x i8] c") as object key\00"
@@ -3925,26 +3966,126 @@ entry:
   ret ptr %joined
 }
 
+define internal i64 @ev_errorcount() {
+entry:
+  %records = load ptr, ptr @j_compile_errors
+  %has = icmp ne ptr %records, null
+  br i1 %has, label %count, label %empty
+count:
+  %n = call i64 @ev_len(ptr %records)
+  ret i64 %n
+empty:
+  ret i64 0
+}
+
+define internal void @ev_modulediagnostics(ptr %module, i64 %first) {
+entry:
+  %error = load ptr, ptr @j_error
+  %failed = icmp ne ptr %error, null
+  br i1 %failed, label %begin, label %done
+begin:
+  %bytesp = getelementptr ptr, ptr %module, i64 2
+  %bytes = load ptr, ptr %bytesp
+  %dp = getelementptr %V, ptr %bytes, i32 0, i32 5
+  %source = load ptr, ptr %dp
+  %length = call i64 @ev_len(ptr %bytes)
+  %pathp = getelementptr ptr, ptr %module, i64 3
+  %filename = load ptr, ptr %pathp
+  %count = call i64 @ev_errorcount()
+  %newrecords = icmp ugt i64 %count, %first
+  br i1 %newrecords, label %records, label %fallback
+fallback:
+  %start = load i64, ptr @j_compile_error_start
+  %end = load i64, ptr @j_compile_error_end
+  %message = call ptr @j_compile_file_diagnostic(ptr %source, i64 %length, i64 %start, i64 %end, ptr %error, ptr %filename)
+  store ptr %message, ptr @j_error
+  store i1 true, ptr @j_compile_error_raw
+  call void @ev_recorderror(ptr %message, i64 0, i64 1, i1 true)
+  br label %done
+records:
+  %errors = load ptr, ptr @j_compile_errors
+  br label %loop
+loop:
+  %i = phi i64 [%first, %records], [%next, %advance]
+  %more = icmp ult i64 %i, %count
+  br i1 %more, label %read, label %done
+read:
+  %record = call ptr @j_at(ptr %errors, i64 %i)
+  %rawvalue = call ptr @j_at(ptr %record, i64 3)
+  %raw = call i1 @j_truth(ptr %rawvalue)
+  br i1 %raw, label %advance, label %format
+format:
+  %text = call ptr @j_at(ptr %record, i64 0)
+  %sv = call ptr @j_at(ptr %record, i64 1)
+  %ev = call ptr @j_at(ptr %record, i64 2)
+  %sp = getelementptr %V, ptr %sv, i32 0, i32 2
+  %ep = getelementptr %V, ptr %ev, i32 0, i32 2
+  %sd = load double, ptr %sp
+  %ed = load double, ptr %ep
+  %si = fptoui double %sd to i64
+  %ei = fptoui double %ed to i64
+  %formatted = call ptr @j_compile_file_diagnostic(ptr %source, i64 %length, i64 %si, i64 %ei, ptr %text, ptr %filename)
+  %rdp = getelementptr %V, ptr %record, i32 0, i32 5
+  %rd = load ptr, ptr %rdp
+  store ptr %formatted, ptr %rd
+  %rp = getelementptr ptr, ptr %rd, i64 3
+  %true = call ptr @j_bool(i1 true)
+  store ptr %true, ptr %rp
+  store ptr %formatted, ptr @j_error
+  store i1 true, ptr @j_compile_error_raw
+  br label %advance
+advance:
+  %next = add i64 %i, 1
+  br label %loop
+done:
+  ret void
+}
+
 define internal ptr @ev_modulefile(ptr %path, i1 %data) {
 entry:
-  %dp = getelementptr %V, ptr %path, i32 0, i32 5
+  %canonical = call ptr @j_fs_canonical(ptr %path)
+  %cache = load ptr, ptr @ev_module_cache
+  %hascache = icmp ne ptr %cache, null
+  %code = xor i1 %data, true
+  %lookup = and i1 %hascache, %code
+  br i1 %lookup, label %cachebegin, label %probe
+cachebegin:
+  %cachen = call i64 @ev_len(ptr %cache)
+  br label %cacheloop
+cacheloop:
+  %ci = phi i64 [0, %cachebegin], [%cnext, %cacheadvance]
+  %cmore = icmp ult i64 %ci, %cachen
+  br i1 %cmore, label %cachebody, label %probe
+cachebody:
+  %cached = call ptr @j_at(ptr %cache, i64 %ci)
+  %cachedpathp = getelementptr ptr, ptr %cached, i64 3
+  %cachedpath = load ptr, ptr %cachedpathp
+  %pathcmp = call i32 @j_cmp(ptr %canonical, ptr %cachedpath)
+  %samepath = icmp eq i32 %pathcmp, 0
+  br i1 %samepath, label %cachedone, label %cacheadvance
+cacheadvance:
+  %cnext = add i64 %ci, 1
+  br label %cacheloop
+cachedone:
+  ret ptr %cached
+probe:
+  %exists = call i1 @j_fs_exists(ptr %canonical)
+  br i1 %exists, label %read, label %failed
+read:
+  %dp = getelementptr %V, ptr %canonical, i32 0, i32 5
   %filename = load ptr, ptr %dp
   %bytes = call ptr @j_read_file(ptr %filename)
-  %missing = icmp eq ptr %bytes, null
-  br i1 %missing, label %failed, label %found
-failed:
-  store ptr null, ptr @j_error
-  ret ptr null
-found:
   %record = call ptr @j_alloc(i64 32)
-  %directory = call ptr @ev_dirname(ptr %path)
+  %directory = call ptr @j_fs_dirname(ptr %canonical)
   %dirp = getelementptr ptr, ptr %record, i64 1
   store ptr %directory, ptr %dirp
   %bytesp = getelementptr ptr, ptr %record, i64 2
   store ptr %bytes, ptr %bytesp
   %pathp = getelementptr ptr, ptr %record, i64 3
-  store ptr %path, ptr %pathp
-  br i1 %data, label %datadone, label %compile
+  store ptr %canonical, ptr %pathp
+  %missingbytes = icmp eq ptr %bytes, null
+  %readstop = or i1 %missingbytes, %data
+  br i1 %readstop, label %datadone, label %compile
 datadone:
   ret ptr %record
 compile:
@@ -3954,75 +4095,52 @@ compile:
   %source = load ptr, ptr %pd
   %length = call i64 @ev_len(ptr %program)
   %saveddepth = load i64, ptr @ev_compile_depth
+  %savedfilename = load ptr, ptr @ev_source_filename
+  store ptr %canonical, ptr @ev_source_filename
+  %firsterror = call i64 @ev_errorcount()
   %parsedepth = add i64 %saveddepth, 1
   store i64 %parsedepth, ptr @ev_compile_depth
   %ast = call ptr @j_compile(ptr %source, i64 %length)
   store i64 %saveddepth, ptr @ev_compile_depth
+  store ptr %savedfilename, ptr @ev_source_filename
   store ptr %ast, ptr %record
+  %error = load ptr, ptr @j_error
+  %valid = icmp eq ptr %error, null
+  br i1 %valid, label %cachecheck, label %diagnostic
+diagnostic:
+  call void @ev_modulediagnostics(ptr %record, i64 %firsterror)
   ret ptr %record
+cachecheck:
+  br i1 %hascache, label %cachecopy, label %cachecreate
+cachecopy:
+  %copycache = call ptr @j_clone(ptr %cache)
+  br label %cacheappend
+cachecreate:
+  %newcache = call ptr @j_array()
+  br label %cacheappend
+cacheappend:
+  %outcache = phi ptr [%copycache, %cachecopy], [%newcache, %cachecreate]
+  call void @j_push(ptr %outcache, ptr %record)
+  store ptr %outcache, ptr @ev_module_cache
+  ret ptr %record
+failed:
+  ret ptr null
 }
 
 define internal ptr @ev_loadmodule(ptr %path, i1 %data, ptr %metadata, ptr %parentdir) {
 entry:
-  %paths = call ptr @j_array()
-  %sk = call ptr @j_cstr(ptr @ev_searchkey)
-  %search = call ptr @j_get(ptr %metadata, ptr %sk)
-  %st = load i32, ptr %search
-  switch i32 %st, label %globalpaths [i32 4, label %searchstring i32 5, label %searcharray]
-searchstring:
-  call void @j_push(ptr %paths, ptr %search)
-  br label %resolve
-searcharray:
-  call void @ev_extend(ptr %paths, ptr %search)
-  br label %resolve
-resolve:
-  %resolven = call i64 @ev_len(ptr %paths)
-  %resolved = call ptr @j_array()
-  %nodir = icmp eq ptr %parentdir, null
-  br label %resolveloop
-resolveloop:
-  %ri = phi i64 [0, %resolve], [%rinext, %resolvedone]
-  %rmore = icmp ult i64 %ri, %resolven
-  br i1 %rmore, label %resolvebody, label %resolvefinish
-resolvebody:
-  %rv = call ptr @j_at(ptr %paths, i64 %ri)
-  %rdp = getelementptr %V, ptr %rv, i32 0, i32 5
-  %rd = load ptr, ptr %rdp
-  %rf = load i8, ptr %rd
-  %relative = icmp eq i8 %rf, 46
-  %hasdir = xor i1 %nodir, true
-  %needsdir = and i1 %relative, %hasdir
-  br i1 %needsdir, label %resolvejoin, label %resolveplain
-resolvejoin:
-  %joined = call ptr @ev_joinpath(ptr %parentdir, ptr %rv)
-  br label %resolvedone
-resolveplain:
-  br label %resolvedone
-resolvedone:
-  %rp = phi ptr [%joined, %resolvejoin], [%rv, %resolveplain]
-  call void @j_push(ptr %resolved, ptr %rp)
-  %rinext = add i64 %ri, 1
-  br label %resolveloop
-resolvefinish:
-  br label %globalpaths
-globalpaths:
-  %dirs = phi ptr [%paths, %entry], [%resolved, %resolvefinish]
-  %global = load ptr, ptr @j_library_paths
-  %hasglobal = icmp ne ptr %global, null
-  br i1 %hasglobal, label %addglobal, label %default
-addglobal:
-  call void @ev_extend(ptr %dirs, ptr %global)
-  br label %default
-default:
-  %dot = call ptr @j_cstr(ptr @ev_dotdir)
-  call void @j_push(ptr %dirs, ptr %dot)
+  %valid = call i1 @j_fs_validate_module(ptr %path)
+  br i1 %valid, label %search, label %invalid
+search:
+  %dirs = call ptr @j_fs_search(ptr %metadata, ptr %parentdir)
+  %searcherror = load ptr, ptr @j_fs_search_error
   %n = call i64 @ev_len(ptr %dirs)
   %exttext = select i1 %data, ptr @ev_jsonextension, ptr @ev_jqextension
   %extension = call ptr @j_cstr(ptr %exttext)
   %basename = call ptr @ev_basename(ptr %path)
   br label %loop
 loop:
-  %i = phi i64 [0, %default], [%next, %advance]
+  %i = phi i64 [0, %search], [%next, %advance]
   %more = icmp ult i64 %i, %n
   br i1 %more, label %body, label %missing
 body:
@@ -4031,7 +4149,14 @@ body:
   %file = call ptr @j_binary(i32 0, ptr %base, ptr %extension)
   %record = call ptr @ev_modulefile(ptr %file, i1 %data)
   %found = icmp ne ptr %record, null
-  br i1 %found, label %founddirect, label %nested
+  br i1 %found, label %founddirect, label %main
+main:
+  %mainname = call ptr @j_cstr(ptr @ev_jqmain)
+  %mainbase = call ptr @ev_joinpath(ptr %base, ptr %mainname)
+  %mainfile = call ptr @j_binary(i32 0, ptr %mainbase, ptr %extension)
+  %mainrecord = call ptr @ev_modulefile(ptr %mainfile, i1 %data)
+  %mainfound = icmp ne ptr %mainrecord, null
+  br i1 %mainfound, label %foundmain, label %nested
 nested:
   %nestedbase = call ptr @ev_joinpath(ptr %base, ptr %basename)
   %nestedfile = call ptr @j_binary(i32 0, ptr %nestedbase, ptr %extension)
@@ -4043,31 +4168,65 @@ advance:
   br label %loop
 founddirect:
   ret ptr %record
+foundmain:
+  ret ptr %mainrecord
 foundnested:
   ret ptr %nestedrecord
 missing:
-  call void @j_fail(ptr @ev_modulenotfound)
+  %prefix = call ptr @j_cstr(ptr @ev_missingprefix)
+  %message = call ptr @j_binary(i32 0, ptr %prefix, ptr %path)
+  %hasreason = icmp ne ptr %searcherror, null
+  br i1 %hasreason, label %reason, label %raise
+reason:
+  %open = call ptr @j_cstr(ptr @ev_openparenthesis)
+  %close = call ptr @j_cstr(ptr @ev_closeparenthesis)
+  %withopen = call ptr @j_binary(i32 0, ptr %message, ptr %open)
+  %withreason = call ptr @j_binary(i32 0, ptr %withopen, ptr %searcherror)
+  %detailed = call ptr @j_binary(i32 0, ptr %withreason, ptr %close)
+  br label %raise
+raise:
+  %error = phi ptr [%message, %missing], [%detailed, %reason]
+  store ptr %error, ptr @j_error
+  ret ptr null
+invalid:
   ret ptr null
 }
 
 define internal ptr @ev_exportenv(ptr %source, ptr %alias, ptr %destination) {
 entry:
-  %empty = icmp eq ptr %source, null
-  br i1 %empty, label %done, label %body
-done:
-  ret ptr %destination
+  %bindings = call ptr @j_array()
+  %globals = load ptr, ptr @j_compile_env
+  br label %collect
+collect:
+  %current = phi ptr [%source, %entry], [%next, %collectbody]
+  %nullenv = icmp eq ptr %current, null
+  %atglobals = icmp eq ptr %current, %globals
+  %empty = or i1 %nullenv, %atglobals
+  br i1 %empty, label %begin, label %collectbody
+collectbody:
+  call void @j_push(ptr %bindings, ptr %current)
+  %next = load ptr, ptr %current
+  br label %collect
+begin:
+  %n = call i64 @ev_len(ptr %bindings)
+  br label %loop
+loop:
+  %i = phi i64 [%n, %begin], [%previous, %bind]
+  %dest = phi ptr [%destination, %begin], [%new, %bind]
+  %more = icmp ugt i64 %i, 0
+  br i1 %more, label %body, label %done
 body:
-  %next = load ptr, ptr %source
-  %dest = call ptr @ev_exportenv(ptr %next, ptr %alias, ptr %destination)
-  %np = getelementptr %E, ptr %source, i32 0, i32 1
+  %previous = sub i64 %i, 1
+  %binding = call ptr @j_at(ptr %bindings, i64 %previous)
+  %np = getelementptr %E, ptr %binding, i32 0, i32 1
   %name = load ptr, ptr %np
-  %vp = getelementptr %E, ptr %source, i32 0, i32 2
+  %vp = getelementptr %E, ptr %binding, i32 0, i32 2
   %value = load ptr, ptr %vp
-  %tp = getelementptr %E, ptr %source, i32 0, i32 3
+  %tp = getelementptr %E, ptr %binding, i32 0, i32 3
   %type = load i32, ptr %tp
-  %pp = getelementptr %E, ptr %source, i32 0, i32 4
+  %pp = getelementptr %E, ptr %binding, i32 0, i32 4
   %params = load ptr, ptr %pp
-  %ep = getelementptr %E, ptr %source, i32 0, i32 5
+  %ep = getelementptr %E, ptr %binding, i32 0, i32 5
   %closure = load ptr, ptr %ep
   %include = icmp eq ptr %alias, null
   br i1 %include, label %plain, label %prefix
@@ -4087,10 +4246,12 @@ bind:
   store ptr %params, ptr %npp
   %nep = getelementptr %E, ptr %new, i32 0, i32 5
   store ptr %closure, ptr %nep
-  ret ptr %new
+  br label %loop
+done:
+  ret ptr %dest
 }
 
-define internal ptr @ev_importenv(ptr %node, ptr %env, ptr %directory) {
+define ptr @ev_importenv(ptr %node, ptr %env, ptr %directory) {
 entry:
   %op.p = getelementptr %N, ptr %node, i32 0, i32 1
   %op = load i32, ptr %op.p
@@ -4101,16 +4262,45 @@ entry:
   %alias = load ptr, ptr %bp
   %dp = getelementptr %N, ptr %node, i32 0, i32 5
   %metadata = load ptr, ptr %dp
+  %optionalkey = call ptr @j_cstr(ptr @ev_optionalkey)
+  %optionalvalue = call ptr @j_get(ptr %metadata, ptr %optionalkey)
+  %optionaltag = load i32, ptr %optionalvalue
+  %optional = icmp eq i32 %optionaltag, 2
   %loaded = call ptr @ev_loadmodule(ptr %path, i1 %data, ptr %metadata, ptr %directory)
   %found = icmp ne ptr %loaded, null
-  br i1 %found, label %dispatch, label %failed
+  br i1 %found, label %loadcheck, label %failed
 failed:
+  br i1 %optional, label %ignore, label %report
+ignore:
+  store ptr null, ptr @j_error
+  ret ptr %env
+report:
+  %importerror = load ptr, ptr @j_error
+  store i1 true, ptr @j_compile_error_raw
+  call void @ev_recorderror(ptr %importerror, i64 0, i64 1, i1 true)
+  ret ptr %env
+loadcheck:
+  %loaderror = load ptr, ptr @j_error
+  %loadfailed = icmp ne ptr %loaderror, null
+  br i1 %loadfailed, label %loadfailure, label %dispatch
+loadfailure:
+  %loadedbytesp = getelementptr ptr, ptr %loaded, i64 2
+  %loadedbytes = load ptr, ptr %loadedbytesp
+  %unreadable = icmp eq ptr %loadedbytes, null
+  br i1 %unreadable, label %failed, label %parsefailure
+parsefailure:
   ret ptr %env
 dispatch:
   br i1 %data, label %dataimport, label %codeimport
 dataimport:
   %bytesp = getelementptr ptr, ptr %loaded, i64 2
   %bytes = load ptr, ptr %bytesp
+  %rawkey = call ptr @j_cstr(ptr @ev_rawkey)
+  %rawvalue = call ptr @j_get(ptr %metadata, ptr %rawkey)
+  %rawtag = load i32, ptr %rawvalue
+  %raw = icmp eq i32 %rawtag, 2
+  br i1 %raw, label %databind, label %dataparse
+dataparse:
   %bdp = getelementptr %V, ptr %bytes, i32 0, i32 5
   %buffer = load ptr, ptr %bdp
   %length = call i64 @ev_len(ptr %bytes)
@@ -4121,16 +4311,21 @@ dataimport:
 dataloop:
   %value = call ptr @j_parse(ptr %buffer, i64 %length, ptr %offset)
   %hasvalue = icmp ne ptr %value, null
-  br i1 %hasvalue, label %dataappend, label %datadone
+  br i1 %hasvalue, label %dataappend, label %datacheck
 dataappend:
   call void @j_push(ptr %values, ptr %value)
   br label %dataloop
-datadone:
-  %short = call ptr @j_bind(ptr %env, ptr %alias, ptr %values)
+datacheck:
+  %dataerror = load ptr, ptr @j_error
+  %datafailed = icmp ne ptr %dataerror, null
+  br i1 %datafailed, label %failed, label %databind
+databind:
+  %importvalue = phi ptr [%bytes, %dataimport], [%values, %datacheck]
+  %short = call ptr @j_bind(ptr %env, ptr %alias, ptr %importvalue)
   %ns = call ptr @j_cstr(ptr @ev_namespace)
   %prefix = call ptr @j_binary(i32 0, ptr %alias, ptr %ns)
   %qualified = call ptr @j_binary(i32 0, ptr %prefix, ptr %alias)
-  %long = call ptr @j_bind(ptr %short, ptr %qualified, ptr %values)
+  %long = call ptr @j_bind(ptr %short, ptr %qualified, ptr %importvalue)
   ret ptr %long
 codeimport:
   %pathp = getelementptr ptr, ptr %loaded, i64 3
@@ -4161,7 +4356,11 @@ stackadvance:
   %stacknext = add i64 %stacki, 1
   br label %stackloop
 circular:
-  call void @j_fail(ptr @ev_circularimport)
+  %cycleprefix = call ptr @j_cstr(ptr @ev_cycleprefix)
+  %cyclemessage = call ptr @j_binary(i32 0, ptr %cycleprefix, ptr %filename)
+  store ptr %cyclemessage, ptr @j_error
+  store i1 true, ptr @j_compile_error_raw
+  call void @ev_recorderror(ptr %cyclemessage, i64 0, i64 1, i1 true)
   ret ptr %env
 stackpush:
   call void @j_push(ptr %stack, ptr %filename)
@@ -4169,62 +4368,63 @@ stackpush:
   %ast = load ptr, ptr %loaded
   %dirp = getelementptr ptr, ptr %loaded, i64 1
   %dir = load ptr, ptr %dirp
+  %firsterror = call i64 @ev_errorcount()
+  %savedvalidationmodule = load ptr, ptr @ev_validation_module
+  %savedvalidationframe = load ptr, ptr @ev_validation_frame
+  %rootvalidationframe = load ptr, ptr @ev_validation_rootframe
+  store ptr %loaded, ptr @ev_validation_module
+  store ptr %rootvalidationframe, ptr @ev_validation_frame
   %moduleenv = call ptr @ev_moduleenv(ptr %ast, ptr null, ptr %dir)
+  store ptr %savedvalidationmodule, ptr @ev_validation_module
+  store ptr %savedvalidationframe, ptr @ev_validation_frame
   store ptr %savedstack, ptr @ev_module_stack
+  call void @ev_modulediagnostics(ptr %loaded, i64 %firsterror)
   %exported = call ptr @ev_exportenv(ptr %moduleenv, ptr %alias, ptr %env)
   ret ptr %exported
 }
 
 define internal ptr @ev_moduleenv(ptr %node, ptr %env, ptr %directory) {
 entry:
-  %none = icmp eq ptr %node, null
+  %globals = load ptr, ptr @j_compile_env
+  %emptyenv = icmp eq ptr %env, null
+  %initial = select i1 %emptyenv, ptr %globals, ptr %env
+  br label %loop
+loop:
+  %current = phi ptr [%node, %entry], [%d, %def], [%c, %import], [%b, %module]
+  %environment = phi ptr [%initial, %entry], [%de, %def], [%ie, %import], [%environment, %module]
+  %none = icmp eq ptr %current, null
   %error = load ptr, ptr @j_error
   %failed = icmp ne ptr %error, null
   %stop = or i1 %none, %failed
-  br i1 %stop, label %done, label %depthcheck
-depthcheck:
-  %depth = load i64, ptr @ev_module_depth
-  %too = icmp ugt i64 %depth, 128
-  br i1 %too, label %cycle, label %dispatch
-cycle:
-  call void @j_fail(ptr @ev_modulecycle)
-  ret ptr %env
+  br i1 %stop, label %done, label %dispatch
 dispatch:
-  %incr = add i64 %depth, 1
-  store i64 %incr, ptr @ev_module_depth
-  %kind = load i32, ptr %node
-  %ap = getelementptr %N, ptr %node, i32 0, i32 2
+  %kind = load i32, ptr %current
+  %ap = getelementptr %N, ptr %current, i32 0, i32 2
   %a = load ptr, ptr %ap
-  %bp = getelementptr %N, ptr %node, i32 0, i32 3
+  %bp = getelementptr %N, ptr %current, i32 0, i32 3
   %b = load ptr, ptr %bp
-  %cp = getelementptr %N, ptr %node, i32 0, i32 4
+  %cp = getelementptr %N, ptr %current, i32 0, i32 4
   %c = load ptr, ptr %cp
-  %dp = getelementptr %N, ptr %node, i32 0, i32 5
+  %dp = getelementptr %N, ptr %current, i32 0, i32 5
   %d = load ptr, ptr %dp
-  switch i32 %kind, label %finish [i32 12, label %def i32 24, label %import i32 25, label %module]
+  switch i32 %kind, label %done [i32 12, label %def i32 24, label %import i32 25, label %module]
 def:
-  %de = call ptr @j_bind(ptr %env, ptr %a, ptr %c)
+  %de = call ptr @j_bind(ptr %environment, ptr %a, ptr %c)
   %dtp = getelementptr %E, ptr %de, i32 0, i32 3
   store i32 1, ptr %dtp
   %dpp = getelementptr %E, ptr %de, i32 0, i32 4
   store ptr %b, ptr %dpp
   %dep = getelementptr %E, ptr %de, i32 0, i32 5
   store ptr %de, ptr %dep
-  %defined = call ptr @ev_moduleenv(ptr %d, ptr %de, ptr %directory)
-  br label %finish
+  call void @ev_validation_register(ptr %de)
+  br label %loop
 import:
-  %ie = call ptr @ev_importenv(ptr %node, ptr %env, ptr %directory)
-  %imported = call ptr @ev_moduleenv(ptr %c, ptr %ie, ptr %directory)
-  br label %finish
+  %ie = call ptr @ev_importenv(ptr %current, ptr %environment, ptr %directory)
+  br label %loop
 module:
-  %moduled = call ptr @ev_moduleenv(ptr %b, ptr %env, ptr %directory)
-  br label %finish
-finish:
-  %result = phi ptr [%env, %dispatch], [%defined, %def], [%imported, %import], [%moduled, %module]
-  store i64 %depth, ptr @ev_module_depth
-  ret ptr %result
+  br label %loop
 done:
-  ret ptr %env
+  ret ptr %environment
 }
 
 define internal ptr @ev_modulemetadata(ptr %path) {
@@ -4356,6 +4556,100 @@ done:
   ret ptr %current
 }
 
+define internal void @ev_validation_register(ptr %closure) {
+entry:
+  %active = load i1, ptr @ev_validation_active
+  br i1 %active, label %record, label %done
+record:
+  %head = load ptr, ptr @ev_validation_bindings
+  %item = call ptr @j_alloc(i64 40)
+  store ptr %head, ptr %item
+  %closurep = getelementptr ptr, ptr %item, i64 1
+  store ptr %closure, ptr %closurep
+  %module = load ptr, ptr @ev_validation_module
+  %modulep = getelementptr ptr, ptr %item, i64 2
+  store ptr %module, ptr %modulep
+  %frame = load ptr, ptr @ev_validation_frame
+  %framep = getelementptr ptr, ptr %item, i64 3
+  store ptr %frame, ptr %framep
+  store ptr %item, ptr @ev_validation_bindings
+  br label %done
+done:
+  ret void
+}
+
+define internal void @ev_validate_function(ptr %definition) {
+entry:
+  %missing = icmp eq ptr %definition, null
+  %error = load ptr, ptr @j_error
+  %failed = icmp ne ptr %error, null
+  %stop = or i1 %missing, %failed
+  br i1 %stop, label %done, label %begin
+begin:
+  %capturep = getelementptr %E, ptr %definition, i32 0, i32 5
+  %capture = load ptr, ptr %capturep
+  %captured = icmp ne ptr %capture, null
+  %closure = select i1 %captured, ptr %capture, ptr %definition
+  %head = load ptr, ptr @ev_validation_bindings
+  br label %lookup
+lookup:
+  %item = phi ptr [%head, %begin], [%next, %advance]
+  %end = icmp eq ptr %item, null
+  br i1 %end, label %register, label %check
+check:
+  %candidatep = getelementptr ptr, ptr %item, i64 1
+  %candidate = load ptr, ptr %candidatep
+  %same = icmp eq ptr %candidate, %closure
+  br i1 %same, label %found, label %advance
+advance:
+  %next = load ptr, ptr %item
+  br label %lookup
+register:
+  call void @ev_validation_register(ptr %closure)
+  %newitem = load ptr, ptr @ev_validation_bindings
+  br label %found
+found:
+  %binding = phi ptr [%item, %check], [%newitem, %register]
+  %usedp = getelementptr i8, ptr %binding, i64 32
+  %used = load i1, ptr %usedp
+  br i1 %used, label %done, label %validate
+validate:
+  store i1 true, ptr %usedp
+  %firsterror = call i64 @ev_errorcount()
+  %framep = getelementptr ptr, ptr %binding, i64 3
+  %ownerframe = load ptr, ptr %framep
+  %oldcount = load i64, ptr %ownerframe
+  %count = add i64 %oldcount, 1
+  store i64 %count, ptr %ownerframe
+  call void @ev_functionlimit(i64 %count)
+  %paramsp = getelementptr %E, ptr %definition, i32 0, i32 4
+  %params = load ptr, ptr %paramsp
+  %parametercount = call i64 @ev_len(ptr %params)
+  call void @ev_functionlimit(i64 %parametercount)
+  %savedframe = load ptr, ptr @ev_validation_frame
+  %savedmodule = load ptr, ptr @ev_validation_module
+  %bodyframe = call ptr @j_alloc(i64 8)
+  %modulep = getelementptr ptr, ptr %binding, i64 2
+  %module = load ptr, ptr %modulep
+  store ptr %bodyframe, ptr @ev_validation_frame
+  store ptr %module, ptr @ev_validation_module
+  %bodyp = getelementptr %E, ptr %definition, i32 0, i32 2
+  %body = load ptr, ptr %bodyp
+  %environment = call ptr @ev_parameterenv(ptr %params, ptr %closure)
+  call void @ev_validate(ptr %body, ptr %environment)
+  %hasmodule = icmp ne ptr %module, null
+  br i1 %hasmodule, label %diagnostic, label %restore
+diagnostic:
+  call void @ev_modulediagnostics(ptr %module, i64 %firsterror)
+  br label %restore
+restore:
+  store ptr %savedframe, ptr @ev_validation_frame
+  store ptr %savedmodule, ptr @ev_validation_module
+  br label %done
+done:
+  ret void
+}
+
 define internal void @ev_validate(ptr %node, ptr %env) {
 entry:
   %none = icmp eq ptr %node, null
@@ -4438,12 +4732,15 @@ argstart:
 argloop:
   %ai = phi i64 [0, %argstart], [%anext, %argbody]
   %amore = icmp ult i64 %ai, %arity
-  br i1 %amore, label %argbody, label %done
+  br i1 %amore, label %argbody, label %functionbody
 argbody:
   %arg = call ptr @j_at(ptr %b, i64 %ai)
   call void @ev_validate(ptr %arg, ptr %env)
   %anext = add i64 %ai, 1
   br label %argloop
+functionbody:
+  call void @ev_validate_function(ptr %def)
+  br label %done
 binding:
   call void @ev_validate(ptr %a, ptr %env)
   call void @ev_validatepattern(ptr %b)
@@ -4456,10 +4753,9 @@ definition:
   store i32 1, ptr %dtp
   %dpp = getelementptr %E, ptr %de, i32 0, i32 4
   store ptr %b, ptr %dpp
-  %denv = call ptr @ev_parameterenv(ptr %b, ptr %de)
-  %localfunctions = call i64 @ev_functioncount(ptr %de)
-  call void @ev_functionlimit(i64 %localfunctions)
-  call void @ev_validate(ptr %c, ptr %denv)
+  %dcp = getelementptr %E, ptr %de, i32 0, i32 5
+  store ptr %de, ptr %dcp
+  call void @ev_validation_register(ptr %de)
   call void @ev_validate(ptr %d, ptr %de)
   br label %done
 reduction:

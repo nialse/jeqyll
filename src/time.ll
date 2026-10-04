@@ -1,3 +1,5 @@
+%TE = type { ptr, i64, i64, i1, i1 }
+
 @j_error = external global ptr
 @j_environ = external global ptr
 @t.names = private constant [107 x i8] c"now\00gmtime\00localtime\00mktime\00strftime\00strflocaltime\00strptime\00fromdate\00fromdateiso8601\00todate\00todateiso8601\00\00"
@@ -16,6 +18,7 @@
 @t.TZ = private constant [3 x i8] c"TZ\00"
 @t.zonebase = private constant [22 x i8] c"/usr/share/zoneinfo/\00\00"
 @t.localfile = private constant [15 x i8] c"/etc/localtime\00"
+@t.posixrules = private constant [31 x i8] c"/usr/share/zoneinfo/posixrules\00"
 @t.errgmtime = private constant [33 x i8] c"gmtime() requires numeric inputs\00"
 @t.errlocaltime = private constant [36 x i8] c"localtime() requires numeric inputs\00"
 @t.errmktimearray = private constant [31 x i8] c"mktime requires array inputs\00\00\00"
@@ -36,7 +39,23 @@
 @t.zone_name = internal global ptr @t.UTC
 
 declare ptr @j_alloc(i64)
+declare ptr @j_alloc_permanent(i64)
+declare ptr @j_posix_timezone(ptr, double)
+declare i1 @j_tzif_valid(ptr, i64)
+declare ptr @j_locale_item(i64, ptr)
+declare i64 @j_locale_parse(ptr, i64, ptr, i64, i64, i64)
+declare ptr @j_locale_alt_digit(i64)
+declare i64 @j_locale_parse_digit(ptr, i64, ptr)
+declare ptr @j_locale_era_at(i64)
+declare ptr @j_locale_era_for(i64, i64, i64)
+declare i64 @j_locale_era_year(ptr, i64, i1)
+declare i1 @j_locale_era_year_valid(ptr, i64)
+declare ptr @j_locale_era_text(ptr, i1)
+declare i1 @j_locale_match_name(ptr, ptr, i64, ptr)
+declare i64 @j_time_iso_week(i64, i64, i64, ptr)
+declare ptr @t_ascii(ptr, i1)
 declare ptr @j_null()
+declare ptr @j_bool(i1)
 declare ptr @j_num(double)
 declare ptr @j_array()
 declare void @j_push(ptr, ptr)
@@ -56,9 +75,7 @@ declare ptr @b_one(ptr)
 declare ptr @b_arg(ptr, i64, ptr, ptr)
 declare i32 @b_find(ptr, ptr)
 declare i32 @clock_gettime(i32, ptr)
-declare i32 @open(ptr, i32, i32)
-declare i64 @read(i32, ptr, i64)
-declare i32 @close(i32)
+declare ptr @j_read_file(ptr)
 declare ptr @j_buffer_new()
 declare void @j_buffer_append(ptr, ptr, i64)
 declare void @j_buffer_byte(ptr, i8)
@@ -73,7 +90,7 @@ define internal i64 @t_floordiv(i64 %a, i64 %b) {
   ret i64 %result
 }
 
-define internal i64 @t_days(i64 %year, i64 %month, i64 %day) {
+define i64 @t_days(i64 %year, i64 %month, i64 %day) {
   %early = icmp sle i64 %month, 2
   %prior = sub i64 %year, 1
   %y = select i1 %early, i64 %prior, i64 %year
@@ -106,7 +123,7 @@ define internal void @t_push_int(ptr %array, i64 %i) {
   ret void
 }
 
-define internal ptr @t_gmtime(double %seconds) {
+define ptr @t_gmtime(double %seconds) {
 entry:
   %low = fcmp oge double %seconds, -6.0e16
   %high = fcmp ole double %seconds, 6.0e16
@@ -183,7 +200,7 @@ convert:
   ret ptr %out
 }
 
-define internal i64 @t_field(ptr %array, i64 %index) {
+define i64 @t_field(ptr %array, i64 %index) {
 entry:
   %length = call i64 @b_len(ptr %array)
   %present = icmp ult i64 %index, %length
@@ -284,6 +301,14 @@ define internal i64 @t_header(ptr %p, i64 %offset) {
 
 define internal i64 @t_timezone(double %seconds) {
 entry:
+  %timevalidlow = fcmp oge double %seconds, -6.0e16
+  %timevalidhigh = fcmp ole double %seconds, 6.0e16
+  %timevalid = and i1 %timevalidlow, %timevalidhigh
+  br i1 %timevalid, label %cachecheck, label %timeerror
+timeerror:
+  call void @j_fail(ptr @t.errdate)
+  ret i64 0
+cachecheck:
   %cached = load ptr, ptr @t.zone_data
   %loaded = icmp ne ptr %cached, null
   br i1 %loaded, label %ready, label %load
@@ -305,6 +330,19 @@ zonename:
 zonefirst:
   %first = load i8, ptr %zdata
   %colon = icmp eq i8 %first, 58
+  br i1 %colon, label %zonepath, label %posixzone
+posixzone:
+  %posix = call ptr @j_posix_timezone(ptr %zone, double %seconds)
+  %hasposix = icmp ne ptr %posix, null
+  br i1 %hasposix, label %posixresult, label %zonepath
+posixresult:
+  %posixoffset = load i64, ptr %posix
+  %posixnamep = getelementptr i8, ptr %posix, i64 8
+  %posixname = load ptr, ptr %posixnamep
+  store ptr %posixname, ptr @t.zone_name
+  store i64 %posixoffset, ptr @t.zone_offset
+  ret i64 %posixoffset
+zonepath:
   %skip = zext i1 %colon to i64
   %zstart = getelementptr i8, ptr %zdata, i64 %skip
   %zl = sub i64 %zlen, %skip
@@ -324,17 +362,23 @@ defaultpath:
   br label %openfile
 openfile:
   %path = phi ptr [ @t.localfile, %defaultpath ], [ %full, %relativepath ], [ %zstart, %absolutepath ]
-  %fd = call i32 @open(ptr %path, i32 0, i32 0)
-  %badfd = icmp slt i32 %fd, 0
-  br i1 %badfd, label %error, label %readfile
+  %savederror = load ptr, ptr @j_error
+  %filevalue = call ptr @j_read_file(ptr %path)
+  store ptr %savederror, ptr @j_error
+  %unreadable = icmp eq ptr %filevalue, null
+  br i1 %unreadable, label %error, label %readfile
 readfile:
-  %bytes = call ptr @j_alloc(i64 1048576)
-  %size_read = call i64 @read(i32 %fd, ptr %bytes, i64 1048576)
-  %closed = call i32 @close(i32 %fd)
+  %bytes = call ptr @b_data(ptr %filevalue)
+  %size_read = call i64 @b_len(ptr %filevalue)
   %short = icmp slt i64 %size_read, 44
-  br i1 %short, label %error, label %save
+  br i1 %short, label %error, label %validatefile
+validatefile:
+  %validfile = call i1 @j_tzif_valid(ptr %bytes, i64 %size_read)
+  br i1 %validfile, label %save, label %error
 save:
-  store ptr %bytes, ptr @t.zone_data
+  %durablebytes = call ptr @j_alloc_permanent(i64 %size_read)
+  call void @j_copy(ptr %durablebytes, ptr %bytes, i64 %size_read)
+  store ptr %durablebytes, ptr @t.zone_data
   store i64 %size_read, ptr @t.zone_size
   br label %ready
 ready:
@@ -379,10 +423,39 @@ block:
   %typebytes = mul i64 %ntypes, 6
   %names = getelementptr i8, ptr %typesbase, i64 %typebytes
   %epoch = fptosi double %seconds to i64
+  %hasfooter = icmp eq i64 %width, 8
+  br i1 %hasfooter, label %footercheck, label %transstart
+footercheck:
+  %notransitions = icmp eq i64 %ntimes, 0
+  br i1 %notransitions, label %footerread, label %lasttransition
+lasttransition:
+  %lastindex = sub i64 %ntimes, 1
+  %lastoffset = mul i64 %lastindex, 8
+  %lastptr = getelementptr i8, ptr %transitions, i64 %lastoffset
+  %lasttime = call i64 @t_be(ptr %lastptr, i64 8)
+  %pastlast = icmp sge i64 %epoch, %lasttime
+  br i1 %pastlast, label %footerread, label %transstart
+footerread:
+  %filesize = load i64, ptr @t.zone_size
+  %footer = call ptr @t_zone_footer(ptr %data, i64 %filesize)
+  %footerexists = icmp ne ptr %footer, null
+  br i1 %footerexists, label %footerevaluate, label %transstart
+footerevaluate:
+  %footervalue = call ptr @j_posix_timezone(ptr %footer, double %seconds)
+  %footerok = icmp ne ptr %footervalue, null
+  br i1 %footerok, label %footerresult, label %transstart
+footerresult:
+  %footoffset = load i64, ptr %footervalue
+  %footnamep = getelementptr i8, ptr %footervalue, i64 8
+  %footname = load ptr, ptr %footnamep
+  store ptr %footname, ptr @t.zone_name
+  store i64 %footoffset, ptr @t.zone_offset
+  ret i64 %footoffset
+transstart:
   br label %transloop
 transloop:
-  %i = phi i64 [ 0, %block ], [ %next, %take ]
-  %index = phi i64 [ 0, %block ], [ %typeindex, %take ]
+  %i = phi i64 [ 0, %transstart ], [ %next, %take ]
+  %index = phi i64 [ 0, %transstart ], [ %typeindex, %take ]
   %done = icmp eq i64 %i, %ntimes
   br i1 %done, label %selected, label %transbody
 transbody:
@@ -421,6 +494,73 @@ utc:
 error:
   call void @j_fail(ptr @t.errzone)
   ret i64 0
+}
+
+define internal ptr @t_zone_footer(ptr %data, i64 %length) {
+entry:
+  %long = icmp uge i64 %length, 46
+  br i1 %long, label %check, label %missing
+check:
+  %last = sub i64 %length, 1
+  %lastp = getelementptr i8, ptr %data, i64 %last
+  %lastchar = load i8, ptr %lastp
+  %newline = icmp eq i8 %lastchar, 10
+  br i1 %newline, label %loop, label %missing
+loop:
+  %i = phi i64 [%last, %check], [%previous, %read]
+  %more = icmp ugt i64 %i, 44
+  br i1 %more, label %read, label %missing
+read:
+  %previous = sub i64 %i, 1
+  %p = getelementptr i8, ptr %data, i64 %previous
+  %c = load i8, ptr %p
+  %found = icmp eq i8 %c, 10
+  br i1 %found, label %result, label %loop
+result:
+  %n = sub i64 %last, %i
+  %text = getelementptr i8, ptr %data, i64 %i
+  %footer = call ptr @j_str(ptr %text, i64 %n)
+  ret ptr %footer
+missing:
+  ret ptr null
+}
+
+define ptr @j_posix_default_rules() {
+entry:
+  %savederror = load ptr, ptr @j_error
+  %filevalue = call ptr @j_read_file(ptr @t.posixrules)
+  store ptr %savederror, ptr @j_error
+  %failed = icmp eq ptr %filevalue, null
+  br i1 %failed, label %missing, label %read
+read:
+  %buffer = call ptr @b_data(ptr %filevalue)
+  %n = call i64 @b_len(ptr %filevalue)
+  %valid = call i1 @j_tzif_valid(ptr %buffer, i64 %n)
+  br i1 %valid, label %footer, label %missing
+footer:
+  %text = call ptr @t_zone_footer(ptr %buffer, i64 %n)
+  %hastext = icmp ne ptr %text, null
+  br i1 %hastext, label %start, label %missing
+start:
+  %bytes = call ptr @b_data(ptr %text)
+  %length = call i64 @b_len(ptr %text)
+  br label %loop
+loop:
+  %i = phi i64 [0, %start], [%next, %body]
+  %more = icmp ult i64 %i, %length
+  br i1 %more, label %body, label %missing
+body:
+  %p = getelementptr i8, ptr %bytes, i64 %i
+  %c = load i8, ptr %p
+  %comma = icmp eq i8 %c, 44
+  %next = add i64 %i, 1
+  br i1 %comma, label %result, label %loop
+result:
+  %suffixlength = sub i64 %length, %i
+  %suffix = call ptr @j_str(ptr %p, i64 %suffixlength)
+  ret ptr %suffix
+missing:
+  ret ptr null
 }
 
 define internal ptr @t_name(ptr %table, i64 %index) {
@@ -489,12 +629,18 @@ finish:
 
 define internal ptr @t_expand(ptr %format) {
 entry:
+  %result = call ptr @t_expand_depth(ptr %format, i64 0)
+  ret ptr %result
+}
+
+define internal ptr @t_expand_depth(ptr %format, i64 %depth) {
+entry:
   %data = call ptr @b_data(ptr %format)
   %len = call i64 @b_len(ptr %format)
   %buffer = call ptr @j_buffer_new()
   br label %loop
 loop:
-  %i = phi i64 [ 0, %entry ], [ %next, %plain ], [ %after, %copy ], [ %after, %expand ]
+  %i = phi i64 [ 0, %entry ], [ %next, %plain ], [ %after, %copy ], [ %after, %expandnested ]
   %done = icmp uge i64 %i, %len
   br i1 %done, label %end, label %body
 body:
@@ -510,11 +656,25 @@ plain:
   br label %loop
 spec:
   %sp = getelementptr i8, ptr %p, i64 1
-  %s = load i8, ptr %sp
-  %after = add i64 %i, 2
+  %firstspec = load i8, ptr %sp
+  %isera = icmp eq i8 %firstspec, 69
+  %thirdindex = add i64 %i, 2
+  %hasthird = icmp ult i64 %thirdindex, %len
+  %eraspec = and i1 %isera, %hasthird
+  br i1 %eraspec, label %eraspecifier, label %plainspecifier
+eraspecifier:
+  %thirdp = getelementptr i8, ptr %data, i64 %thirdindex
+  %thirdspec = load i8, ptr %thirdp
+  br label %specifier
+plainspecifier:
+  br label %specifier
+specifier:
+  %s = phi i8 [%thirdspec, %eraspecifier], [%firstspec, %plainspecifier]
+  %directivewidth = select i1 %eraspec, i64 3, i64 2
+  %after = add i64 %i, %directivewidth
   switch i8 %s, label %copy [ i8 70, label %date i8 84, label %clock i8 82, label %shortclock i8 68, label %slashdate i8 120, label %slashdate i8 88, label %clock i8 99, label %cformat i8 114, label %rformat ]
 copy:
-  call void @j_buffer_append(ptr %buffer, ptr %p, i64 2)
+  call void @j_buffer_append(ptr %buffer, ptr %p, i64 %directivewidth)
   br label %loop
 date:
   br label %expand
@@ -529,9 +689,39 @@ cformat:
 rformat:
   br label %expand
 expand:
-  %text = phi ptr [ @t.date, %date ], [ @t.clock, %clock ], [ @t.shortclock, %shortclock ], [ @t.slashdate, %slashdate ], [ @t.cformat, %cformat ], [ @t.rformat, %rformat ]
-  %length = call i64 @j_strlen(ptr %text)
-  call void @j_buffer_append(ptr %buffer, ptr %text, i64 %length)
+  %fallback = phi ptr [ @t.date, %date ], [ @t.clock, %clock ], [ @t.shortclock, %shortclock ], [ @t.slashdate, %slashdate ], [ @t.cformat, %cformat ], [ @t.rformat, %rformat ]
+  %isx = icmp eq i8 %s, 120
+  %isX = icmp eq i8 %s, 88
+  %isc = icmp eq i8 %s, 99
+  %isr = icmp eq i8 %s, 114
+  %ix0 = select i1 %isx, i64 41, i64 -1
+  %ix1 = select i1 %isX, i64 42, i64 %ix0
+  %ix2 = select i1 %isc, i64 40, i64 %ix1
+  %item = select i1 %isr, i64 43, i64 %ix2
+  %normaltext = call ptr @j_locale_item(i64 %item, ptr %fallback)
+  %normalfirst = load i8, ptr %normaltext
+  %normalempty = icmp eq i8 %normalfirst, 0
+  %normalvalue = select i1 %normalempty, ptr %fallback, ptr %normaltext
+  %eraix0 = select i1 %isx, i64 46, i64 -1
+  %eraix1 = select i1 %isX, i64 49, i64 %eraix0
+  %eraix2 = select i1 %isc, i64 48, i64 %eraix1
+  %eraindex = select i1 %eraspec, i64 %eraix2, i64 -1
+  %eratext = call ptr @j_locale_item(i64 %eraindex, ptr %normalvalue)
+  %erafirst = load i8, ptr %eratext
+  %eraempty = icmp eq i8 %erafirst, 0
+  %text = select i1 %eraempty, ptr %normalvalue, ptr %eratext
+  %nestedformat = call ptr @j_cstr(ptr %text)
+  %nextdepth = add i64 %depth, 1
+  %deep = icmp uge i64 %depth, 32
+  br i1 %deep, label %expanddeep, label %expandnested
+expanddeep:
+  call void @j_fail(ptr @t.errformat)
+  br label %end
+expandnested:
+  %nested = call ptr @t_expand_depth(ptr %nestedformat, i64 %nextdepth)
+  %nesteddata = call ptr @b_data(ptr %nested)
+  %nestedlength = call i64 @b_len(ptr %nested)
+  call void @j_buffer_append(ptr %buffer, ptr %nesteddata, i64 %nestedlength)
   br label %loop
 end:
   %out = call ptr @j_buffer_value(ptr %buffer)
@@ -539,6 +729,12 @@ end:
 }
 
 define internal ptr @t_format(ptr %array, ptr %format, double %epochseconds, i1 %local) {
+entry:
+  %result = call ptr @t_format_depth(ptr %array, ptr %format, double %epochseconds, i1 %local, i64 0)
+  ret ptr %result
+}
+
+define internal ptr @t_format_depth(ptr %array, ptr %format, double %epochseconds, i1 %local, i64 %depth) {
 entry:
   %expanded = call ptr @t_expand(ptr %format)
   %data = call ptr @b_data(ptr %expanded)
@@ -554,9 +750,14 @@ entry:
   %weekdayvalue = call i64 @t_field(ptr %array, i64 6)
   %yearday0 = call i64 @t_field(ptr %array, i64 7)
   %yeardayvalue = add i64 %yearday0, 1
+  %weekyearslot = alloca i64
+  %isoweekvalue = call i64 @j_time_iso_week(i64 %yearvalue, i64 %yearday0, i64 %weekdayvalue, ptr %weekyearslot)
+  %isoyearvalue = load i64, ptr %weekyearslot
+  %era = call ptr @j_locale_era_for(i64 %yearvalue, i64 %month0, i64 %dayvalue)
+  %hasera = icmp ne ptr %era, null
   br label %loop
 loop:
-  %i = phi i64 [ 0, %entry ], [ %next, %plain ], [ %after, %numeric ], [ %after, %text ], [ %after, %single ], [ %after, %zone ], [ %after, %unsupported ]
+  %i = phi i64 [ 0, %entry ], [ %next, %plain ], [ %after, %numericplain ], [ %after, %numericlocalized ], [ %after, %text ], [ %after, %single ], [ %after, %zone ], [ %after, %unsupported ]
   %done = icmp uge i64 %i, %length
   br i1 %done, label %end, label %body
 body:
@@ -576,6 +777,8 @@ modifiers:
   %position = phi i64 [ %next, %specstart ], [ %modnext, %modifier ]
   %padding = phi i8 [ 48, %specstart ], [ %newpadding, %modifier ]
   %nopad = phi i1 [ false, %specstart ], [ %newnopad, %modifier ]
+  %alternative = phi i1 [false, %specstart], [%newalternative, %modifier]
+  %eramodifier = phi i1 [false, %specstart], [%neweramodifier, %modifier]
   %sp = getelementptr i8, ptr %data, i64 %position
   %s = load i8, ptr %sp
   %ismod1 = icmp eq i8 %s, 69
@@ -595,10 +798,45 @@ modifier:
   %padzero = select i1 %zeropad, i8 48, i8 %padding
   %newpadding = select i1 %spacepad, i8 32, i8 %padzero
   %newnopad = or i1 %nopad, %dash
+  %newalternative = or i1 %alternative, %ismod2
+  %neweramodifier = or i1 %eramodifier, %ismod1
   br label %modifiers
 dispatch:
   %after = add i64 %position, 1
-  switch i8 %s, label %unsupported [ i8 89, label %year i8 121, label %year2 i8 67, label %century i8 109, label %month i8 100, label %day i8 101, label %dayblank i8 72, label %hour i8 107, label %hourblank i8 73, label %hour12 i8 108, label %hour12 i8 77, label %minute i8 83, label %second i8 106, label %yearday i8 119, label %weekday i8 117, label %isoweekday i8 65, label %weekdayname i8 97, label %weekdayname i8 66, label %monthname i8 98, label %monthname i8 104, label %monthname i8 112, label %ampm i8 80, label %ampm i8 90, label %zonename i8 122, label %zone i8 115, label %epoch i8 37, label %literalpercent i8 110, label %newline i8 116, label %tab i8 85, label %week_sunday i8 87, label %week_monday ]
+  %useera = and i1 %hasera, %eramodifier
+  br i1 %useera, label %eradispatch, label %normaldispatch
+eradispatch:
+  switch i8 %s, label %normaldispatch [i8 67, label %eraname i8 121, label %erayear i8 89, label %erafull]
+eraname:
+  %eranametext = call ptr @j_locale_era_text(ptr %era, i1 false)
+  %eranamelen = call i64 @j_strlen(ptr %eranametext)
+  br label %text
+erayear:
+  %erayearvalue = call i64 @j_locale_era_year(ptr %era, i64 %yearvalue, i1 false)
+  br label %numeric
+erafull:
+  %eratoodeep = icmp uge i64 %depth, 32
+  br i1 %eratoodeep, label %eradeep, label %eraexpand
+eradeep:
+  call void @j_fail(ptr @t.errformat)
+  br label %end
+eraexpand:
+  %eraformattext = call ptr @j_locale_era_text(ptr %era, i1 true)
+  %eraformat = call ptr @j_cstr(ptr %eraformattext)
+  %eranextdepth = add i64 %depth, 1
+  %eraformatted = call ptr @t_format_depth(ptr %array, ptr %eraformat, double %epochseconds, i1 %local, i64 %eranextdepth)
+  %eraformatteddata = call ptr @b_data(ptr %eraformatted)
+  %eraformattedlen = call i64 @b_len(ptr %eraformatted)
+  br label %text
+normaldispatch:
+  switch i8 %s, label %unsupported [ i8 89, label %year i8 121, label %year2 i8 67, label %century i8 109, label %month i8 100, label %day i8 101, label %dayblank i8 72, label %hour i8 107, label %hourblank i8 73, label %hour12 i8 108, label %hour12 i8 77, label %minute i8 83, label %second i8 106, label %yearday i8 119, label %weekday i8 117, label %isoweekday i8 65, label %weekdayname i8 97, label %weekdayname i8 66, label %monthname i8 98, label %monthname i8 104, label %monthname i8 112, label %ampm i8 80, label %ampm i8 90, label %zonename i8 122, label %zone i8 115, label %epoch i8 37, label %literalpercent i8 110, label %newline i8 116, label %tab i8 85, label %week_sunday i8 87, label %week_monday i8 86, label %iso_week i8 71, label %iso_year i8 103, label %iso_year2 ]
+iso_week:
+  br label %numeric
+iso_year:
+  br label %numeric
+iso_year2:
+  %iy2 = srem i64 %isoyearvalue, 100
+  br label %numeric
 year:
   br label %numeric
 year2:
@@ -650,27 +888,57 @@ week_monday:
   %wmonday = udiv i64 %wmplus, 7
   br label %numeric
 numeric:
-  %n = phi i64 [ %yearvalue, %year ], [ %y2, %year2 ], [ %cent, %century ], [ %monthvalue, %month ], [ %dayvalue, %day ], [ %dayvalue, %dayblank ], [ %hourvalue, %hour ], [ %hourvalue, %hourblank ], [ %h12, %hour12 ], [ %minutevalue, %minute ], [ %secondvalue, %second ], [ %yeardayvalue, %yearday ], [ %weekdayvalue, %weekday ], [ %iso, %isoweekday ], [ %timestamp, %epoch ], [ %wsunday, %week_sunday ], [ %wmonday, %week_monday ]
-  %width = phi i64 [ 4, %year ], [ 2, %year2 ], [ 2, %century ], [ 2, %month ], [ 2, %day ], [ 2, %dayblank ], [ 2, %hour ], [ 2, %hourblank ], [ 2, %hour12 ], [ 2, %minute ], [ 2, %second ], [ 3, %yearday ], [ 1, %weekday ], [ 1, %isoweekday ], [ 1, %epoch ], [ 2, %week_sunday ], [ 2, %week_monday ]
-  %defaultpad = phi i8 [ %padding, %year ], [ %padding, %year2 ], [ %padding, %century ], [ %padding, %month ], [ %padding, %day ], [ 32, %dayblank ], [ %padding, %hour ], [ 32, %hourblank ], [ %padding, %hour12 ], [ %padding, %minute ], [ %padding, %second ], [ %padding, %yearday ], [ %padding, %weekday ], [ %padding, %isoweekday ], [ %padding, %epoch ], [ %padding, %week_sunday ], [ %padding, %week_monday ]
+  %n = phi i64 [ %yearvalue, %year ], [ %y2, %year2 ], [ %cent, %century ], [ %monthvalue, %month ], [ %dayvalue, %day ], [ %dayvalue, %dayblank ], [ %hourvalue, %hour ], [ %hourvalue, %hourblank ], [ %h12, %hour12 ], [ %minutevalue, %minute ], [ %secondvalue, %second ], [ %yeardayvalue, %yearday ], [ %weekdayvalue, %weekday ], [ %iso, %isoweekday ], [ %timestamp, %epoch ], [ %wsunday, %week_sunday ], [ %wmonday, %week_monday ], [%isoweekvalue, %iso_week], [%isoyearvalue, %iso_year], [%iy2, %iso_year2], [%erayearvalue, %erayear]
+  %width = phi i64 [ 4, %year ], [ 2, %year2 ], [ 2, %century ], [ 2, %month ], [ 2, %day ], [ 2, %dayblank ], [ 2, %hour ], [ 2, %hourblank ], [ 2, %hour12 ], [ 2, %minute ], [ 2, %second ], [ 3, %yearday ], [ 1, %weekday ], [ 1, %isoweekday ], [ 1, %epoch ], [ 2, %week_sunday ], [ 2, %week_monday ], [2, %iso_week], [4, %iso_year], [2, %iso_year2], [2, %erayear]
+  %defaultpad = phi i8 [ %padding, %year ], [ %padding, %year2 ], [ %padding, %century ], [ %padding, %month ], [ %padding, %day ], [ 32, %dayblank ], [ %padding, %hour ], [ 32, %hourblank ], [ %padding, %hour12 ], [ %padding, %minute ], [ %padding, %second ], [ %padding, %yearday ], [ %padding, %weekday ], [ %padding, %isoweekday ], [ %padding, %epoch ], [ %padding, %week_sunday ], [ %padding, %week_monday ], [%padding, %iso_week], [%padding, %iso_year], [%padding, %iso_year2], [%padding, %erayear]
   %effectivewidth = select i1 %nopad, i64 1, i64 %width
+  br i1 %alternative, label %numericlookup, label %numericplain
+numericlookup:
+  %alttext = call ptr @j_locale_alt_digit(i64 %n)
+  %hasalt = icmp ne ptr %alttext, null
+  br i1 %hasalt, label %numericlocalized, label %numericplain
+numericlocalized:
+  %altlength = call i64 @j_strlen(ptr %alttext)
+  call void @j_buffer_append(ptr %buffer, ptr %alttext, i64 %altlength)
+  br label %loop
+numericplain:
   call void @t_uint(ptr %buffer, i64 %n, i64 %effectivewidth, i8 %defaultpad)
   br label %loop
 weekdayname:
-  %wname = call ptr @t_name(ptr @t.weekdays, i64 %weekdayvalue)
-  %wfull = call i64 @j_strlen(ptr %wname)
+  %wfallback = call ptr @t_name(ptr @t.weekdays, i64 %weekdayvalue)
+  %wfull = call i64 @j_strlen(ptr %wfallback)
   %wshort = icmp eq i8 %s, 97
-  %wlen = select i1 %wshort, i64 3, i64 %wfull
+  %wfalllen = select i1 %wshort, i64 3, i64 %wfull
+  %wfallstr = call ptr @j_str(ptr %wfallback, i64 %wfalllen)
+  %wfallptr = call ptr @b_data(ptr %wfallstr)
+  %witembase = select i1 %wshort, i64 0, i64 7
+  %windex = add i64 %witembase, %weekdayvalue
+  %wname = call ptr @j_locale_item(i64 %windex, ptr %wfallptr)
+  %wlen = call i64 @j_strlen(ptr %wname)
   br label %text
 monthname:
-  %mname = call ptr @t_name(ptr @t.months, i64 %month0)
-  %mfull = call i64 @j_strlen(ptr %mname)
+  %mfallback = call ptr @t_name(ptr @t.months, i64 %month0)
+  %mfull = call i64 @j_strlen(ptr %mfallback)
   %mlong = icmp eq i8 %s, 66
-  %mlen = select i1 %mlong, i64 %mfull, i64 3
+  %mfalllen = select i1 %mlong, i64 %mfull, i64 3
+  %mfallstr = call ptr @j_str(ptr %mfallback, i64 %mfalllen)
+  %mfallptr = call ptr @b_data(ptr %mfallstr)
+  %mbase = select i1 %mlong, i64 26, i64 14
+  %mindex = add i64 %mbase, %month0
+  %mname = call ptr @j_locale_item(i64 %mindex, ptr %mfallptr)
+  %mlen = call i64 @j_strlen(ptr %mname)
   br label %text
 ampm:
   %pm = icmp uge i64 %hourvalue, 12
-  %apname = select i1 %pm, ptr @t.pm, ptr @t.am
+  %ampfallback = select i1 %pm, ptr @t.pm, ptr @t.am
+  %ampitem = select i1 %pm, i64 39, i64 38
+  %amplocal = call ptr @j_locale_item(i64 %ampitem, ptr %ampfallback)
+  %ampstring = call ptr @j_cstr(ptr %amplocal)
+  %amplower = call ptr @t_ascii(ptr %ampstring, i1 false)
+  %amplowerdata = call ptr @b_data(ptr %amplower)
+  %isloweramp = icmp eq i8 %s, 80
+  %apname = select i1 %isloweramp, ptr %amplowerdata, ptr %amplocal
+  %amplen = call i64 @j_strlen(ptr %apname)
   br label %text
 zonename:
   %localname = load ptr, ptr @t.zone_name
@@ -678,8 +946,8 @@ zonename:
   %zlen = call i64 @j_strlen(ptr %zname)
   br label %text
 text:
-  %textdata = phi ptr [ %wname, %weekdayname ], [ %mname, %monthname ], [ %apname, %ampm ], [ %zname, %zonename ]
-  %textlen = phi i64 [ %wlen, %weekdayname ], [ %mlen, %monthname ], [ 2, %ampm ], [ %zlen, %zonename ]
+  %textdata = phi ptr [ %wname, %weekdayname ], [ %mname, %monthname ], [ %apname, %ampm ], [ %zname, %zonename ], [%eranametext, %eraname], [%eraformatteddata, %eraexpand]
+  %textlen = phi i64 [ %wlen, %weekdayname ], [ %mlen, %monthname ], [ %amplen, %ampm ], [ %zlen, %zonename ], [%eranamelen, %eraname], [%eraformattedlen, %eraexpand]
   call void @j_buffer_append(ptr %buffer, ptr %textdata, i64 %textlen)
   br label %loop
 zone:
@@ -707,8 +975,8 @@ single:
   call void @j_buffer_byte(ptr %buffer, i8 %char)
   br label %loop
 unsupported:
-  call void @j_buffer_byte(ptr %buffer, i8 37)
-  call void @j_buffer_byte(ptr %buffer, i8 %s)
+  %unsupportedlength = sub i64 %after, %i
+  call void @j_buffer_append(ptr %buffer, ptr %p, i64 %unsupportedlength)
   br label %loop
 end:
   %result = call ptr @j_buffer_value(ptr %buffer)
@@ -997,6 +1265,21 @@ error:
 
 define internal ptr @t_strptime(ptr %input, ptr %format) {
 entry:
+  %fields = call ptr @j_alloc(i64 64)
+  store i64 1900, ptr %fields
+  %offset = alloca i64
+  store i64 0, ptr %offset
+  %ampm = alloca i64
+  store i64 -1, ptr %ampm
+  %eras = call ptr @j_alloc(i64 32)
+  %centuryp = getelementptr %TE, ptr %eras, i32 0, i32 2
+  store i64 -1, ptr %centuryp
+  %result = call ptr @t_strptime_depth(ptr %input, ptr %format, ptr %fields, ptr %ampm, ptr %eras, ptr %offset, i64 0, i1 false)
+  ret ptr %result
+}
+
+define internal ptr @t_strptime_depth(ptr %input, ptr %format, ptr %fields, ptr %ampm, ptr %eras, ptr %offset, i64 %depth, i1 %fragment) {
+entry:
   %it = call i32 @b_tag(ptr %input)
   %ft = call i32 @b_tag(ptr %format)
   %is = icmp eq i32 %it, 4
@@ -1012,15 +1295,13 @@ start:
   %flen = call i64 @b_len(ptr %expanded)
   %data = call ptr @b_data(ptr %input)
   %length = call i64 @b_len(ptr %input)
-  %offset = alloca i64
-  store i64 0, ptr %offset
-  %fields = call ptr @j_alloc(i64 64)
-  store i64 1900, ptr %fields
-  %ampm = alloca i64
-  store i64 -1, ptr %ampm
+  %erayearp = getelementptr %TE, ptr %eras, i32 0, i32 1
+  %centuryp = getelementptr %TE, ptr %eras, i32 0, i32 2
+  %haserayearp = getelementptr %TE, ptr %eras, i32 0, i32 3
+  %wantcenturyp = getelementptr %TE, ptr %eras, i32 0, i32 4
   br label %loop
 loop:
-  %i = phi i64 [ 0, %start ], [ %next, %plain ], [ %next, %space ], [ %after, %storefield ], [ %after, %ampmstore ], [ %after, %weekdayname ], [ %after, %specspace ], [ %after, %literalpercent ], [ %after, %zoneskip ]
+  %i = phi i64 [ 0, %start ], [ %next, %plain ], [ %next, %space ], [ %after, %storefield ], [ %after, %ampmcontinue ], [ %after, %weekdayname ], [ %after, %specspace ], [ %after, %literalpercent ], [ %after, %zoneskip ], [%after, %eranamestored], [%after, %erayearstored], [%after, %erafullmatched], [%after, %centurystored]
   %done = icmp uge i64 %i, %flen
   br i1 %done, label %finish, label %body
 body:
@@ -1064,7 +1345,106 @@ specfirst:
   %sp = getelementptr i8, ptr %fmt, i64 %specpos
   %s = load i8, ptr %sp
   %after = add i64 %specpos, 1
-  switch i8 %s, label %mismatch [ i8 89, label %numspec i8 121, label %numspec i8 109, label %numspec i8 100, label %numspec i8 101, label %numspec i8 72, label %numspec i8 73, label %numspec i8 77, label %numspec i8 83, label %numspec i8 106, label %numspec i8 119, label %numspec i8 117, label %numspec i8 65, label %weekdayparse i8 97, label %weekdayparse i8 66, label %monthparse i8 98, label %monthparse i8 104, label %monthparse i8 112, label %ampmparse i8 37, label %percentcheck i8 110, label %specspace i8 116, label %specspace i8 122, label %zoneparse i8 90, label %zonenameparse ]
+  br i1 %ismodE, label %eradispatch, label %normaldispatch
+eradispatch:
+  switch i8 %s, label %normaldispatch [i8 67, label %eranameparse i8 121, label %erayearparse i8 89, label %erafullparse]
+eranameparse:
+  %knownera = load ptr, ptr %eras
+  %hasknownera = icmp ne ptr %knownera, null
+  br i1 %hasknownera, label %eranameknown, label %eranameloop
+eranameknown:
+  %knownname = call ptr @j_locale_era_text(ptr %knownera, i1 false)
+  %knownmatch = call i1 @j_locale_match_name(ptr %knownname, ptr %data, i64 %length, ptr %offset)
+  br i1 %knownmatch, label %eranamestored, label %mismatch
+eranameloop:
+  %erani = phi i64 [0, %eranameparse], [%erannext, %eranamenext]
+  %nameera = call ptr @j_locale_era_at(i64 %erani)
+  %nameerapresent = icmp ne ptr %nameera, null
+  br i1 %nameerapresent, label %eranamecandidate, label %numspec
+eranamecandidate:
+  %candidatename = call ptr @j_locale_era_text(ptr %nameera, i1 false)
+  %candidatematch = call i1 @j_locale_match_name(ptr %candidatename, ptr %data, i64 %length, ptr %offset)
+  br i1 %candidatematch, label %eranamestored, label %eranamenext
+eranamenext:
+  %erannext = add i64 %erani, 1
+  br label %eranameloop
+eranamestored:
+  %namedrecord = phi ptr [%knownera, %eranameknown], [%nameera, %eranamecandidate]
+  store ptr %namedrecord, ptr %eras
+  br label %loop
+erayearparse:
+  %existingera = load ptr, ptr %eras
+  %existingpresent = icmp ne ptr %existingera, null
+  %firstera = call ptr @j_locale_era_at(i64 0)
+  %firstpresent = icmp ne ptr %firstera, null
+  %anyera = or i1 %existingpresent, %firstpresent
+  br i1 %anyera, label %erayearread, label %numspec
+erayearread:
+  %eraoffset0 = load i64, ptr %offset
+  %eraclean = call i64 @t_skip_space(ptr %data, i64 %length, i64 %eraoffset0)
+  store i64 %eraclean, ptr %offset
+  %parsedyear = call i64 @t_read_uint(ptr %data, i64 %length, ptr %offset, i64 4)
+  %parsedyearvalid = icmp sge i64 %parsedyear, 0
+  br i1 %parsedyearvalid, label %erayearloop, label %mismatch
+erayearloop:
+  %erayi = phi i64 [0, %erayearread], [%eraynext, %erayearnext]
+  %enumeratedera = call ptr @j_locale_era_at(i64 %erayi)
+  %yearera = select i1 %existingpresent, ptr %existingera, ptr %enumeratedera
+  %yearerapresent = icmp ne ptr %yearera, null
+  br i1 %yearerapresent, label %erayearcandidate, label %mismatch
+erayearcandidate:
+  %candidateyear = call i64 @j_locale_era_year(ptr %yearera, i64 %parsedyear, i1 true)
+  %yearvalid = call i1 @j_locale_era_year_valid(ptr %yearera, i64 %candidateyear)
+  br i1 %yearvalid, label %erayearstored, label %erayearreject
+erayearreject:
+  br i1 %existingpresent, label %mismatch, label %erayearnext
+erayearnext:
+  %eraynext = add i64 %erayi, 1
+  br label %erayearloop
+erayearstored:
+  store ptr %yearera, ptr %eras
+  store i64 %parsedyear, ptr %erayearp
+  store i1 true, ptr %haserayearp
+  br label %loop
+erafullparse:
+  %erafulltoodeep = icmp uge i64 %depth, 32
+  br i1 %erafulltoodeep, label %mismatch, label %erafullsave
+erafullsave:
+  %savedfields = call ptr @j_alloc(i64 64)
+  %savederas = call ptr @j_alloc(i64 32)
+  call void @j_copy(ptr %savedfields, ptr %fields, i64 64)
+  call void @j_copy(ptr %savederas, ptr %eras, i64 32)
+  %savedoffset = load i64, ptr %offset
+  %savedampm = load i64, ptr %ampm
+  %nextdepth = add i64 %depth, 1
+  br label %erafullcandidate
+erafullcandidate:
+  %erafi = phi i64 [0, %erafullsave], [%erafnext, %erafullnext]
+  call void @j_copy(ptr %fields, ptr %savedfields, i64 64)
+  call void @j_copy(ptr %eras, ptr %savederas, i64 32)
+  store i64 %savedoffset, ptr %offset
+  store i64 %savedampm, ptr %ampm
+  %fullera = call ptr @j_locale_era_at(i64 %erafi)
+  %fullerapresent = icmp ne ptr %fullera, null
+  br i1 %fullerapresent, label %erafulltry, label %numspec
+erafulltry:
+  store ptr %fullera, ptr %eras
+  %erafmttext = call ptr @j_locale_era_text(ptr %fullera, i1 true)
+  %erafmtfirst = load i8, ptr %erafmttext
+  %erafmtnonempty = icmp ne i8 %erafmtfirst, 0
+  br i1 %erafmtnonempty, label %erafullrecurse, label %erafullnext
+erafullrecurse:
+  %erafmt = call ptr @j_cstr(ptr %erafmttext)
+  %erafullresult = call ptr @t_strptime_depth(ptr %input, ptr %erafmt, ptr %fields, ptr %ampm, ptr %eras, ptr %offset, i64 %nextdepth, i1 true)
+  %erafullsuccess = icmp ne ptr %erafullresult, null
+  br i1 %erafullsuccess, label %erafullmatched, label %erafullnext
+erafullnext:
+  %erafnext = add i64 %erafi, 1
+  br label %erafullcandidate
+erafullmatched:
+  br label %loop
+normaldispatch:
+  switch i8 %s, label %mismatch [ i8 89, label %numspec i8 121, label %numspec i8 67, label %numspec i8 109, label %numspec i8 100, label %numspec i8 101, label %numspec i8 72, label %numspec i8 73, label %numspec i8 77, label %numspec i8 83, label %numspec i8 106, label %numspec i8 119, label %numspec i8 117, label %numspec i8 65, label %weekdayparse i8 97, label %weekdayparse i8 66, label %monthparse i8 98, label %monthparse i8 104, label %monthparse i8 112, label %ampmparse i8 37, label %percentcheck i8 110, label %specspace i8 116, label %specspace i8 122, label %zoneparse i8 90, label %zonenameparse ]
 numspec:
   %before = load i64, ptr %offset
   %clean = call i64 @t_skip_space(ptr %data, i64 %length, i64 %before)
@@ -1073,14 +1453,28 @@ numspec:
   %dayspec = icmp eq i8 %s, 106
   %otherwidth = select i1 %dayspec, i64 3, i64 2
   %width = select i1 %yearspec, i64 4, i64 %otherwidth
-  %number = call i64 @t_read_uint(ptr %data, i64 %length, ptr %offset, i64 %width)
+  br i1 %ismodO, label %alternatenumber, label %ordinarynumber
+alternatenumber:
+  %localizednumber = call i64 @j_locale_parse_digit(ptr %data, i64 %length, ptr %offset)
+  %haslocalizednumber = icmp sge i64 %localizednumber, 0
+  br i1 %haslocalizednumber, label %numbercheck, label %ordinarynumber
+ordinarynumber:
+  %plainnumber = call i64 @t_read_uint(ptr %data, i64 %length, ptr %offset, i64 %width)
+  br label %numbercheck
+numbercheck:
+  %number = phi i64 [%localizednumber, %alternatenumber], [%plainnumber, %ordinarynumber]
   %numberbad = icmp slt i64 %number, 0
   br i1 %numberbad, label %mismatch, label %numberdispatch
 numberdispatch:
-  switch i8 %s, label %second [ i8 89, label %year i8 121, label %year2 i8 109, label %month i8 100, label %day i8 101, label %day i8 72, label %hour i8 73, label %hour i8 77, label %minute i8 106, label %yearday i8 119, label %weekday i8 117, label %weekday ]
+  switch i8 %s, label %second [ i8 89, label %year i8 121, label %year2 i8 67, label %centurystored i8 109, label %month i8 100, label %day i8 101, label %day i8 72, label %hour i8 73, label %hour i8 77, label %minute i8 106, label %yearday i8 119, label %weekday i8 117, label %weekday ]
+centurystored:
+  store i64 %number, ptr %centuryp
+  br label %loop
 year:
+  store i1 false, ptr %wantcenturyp
   br label %storefield
 year2:
+  store i1 true, ptr %wantcenturyp
   %recent = icmp ule i64 %number, 68
   %century = select i1 %recent, i64 2000, i64 1900
   %full_year = add i64 %century, %number
@@ -1119,13 +1513,27 @@ yearday:
 weekday:
   br label %storefield
 monthparse:
-  %monthindex = call i64 @t_parse_name(ptr %data, i64 %length, ptr %offset, ptr @t.months, i64 12)
+  %localmonth = call i64 @j_locale_parse(ptr %data, i64 %length, ptr %offset, i64 26, i64 12, i64 14)
+  %haslocalmonth = icmp sge i64 %localmonth, 0
+  br i1 %haslocalmonth, label %monthparsed, label %englishmonth
+englishmonth:
+  %engmonth = call i64 @t_parse_name(ptr %data, i64 %length, ptr %offset, ptr @t.months, i64 12)
+  br label %monthparsed
+monthparsed:
+  %monthindex = phi i64 [%localmonth, %monthparse], [%engmonth, %englishmonth]
   %monthmissing = icmp slt i64 %monthindex, 0
   br i1 %monthmissing, label %mismatch, label %monthname
 monthname:
   br label %storefield
 weekdayparse:
-  %dayindex = call i64 @t_parse_name(ptr %data, i64 %length, ptr %offset, ptr @t.weekdays, i64 7)
+  %localday = call i64 @j_locale_parse(ptr %data, i64 %length, ptr %offset, i64 7, i64 7, i64 0)
+  %haslocalday = icmp sge i64 %localday, 0
+  br i1 %haslocalday, label %dayparsed, label %englishday
+englishday:
+  %engday = call i64 @t_parse_name(ptr %data, i64 %length, ptr %offset, ptr @t.weekdays, i64 7)
+  br label %dayparsed
+dayparsed:
+  %dayindex = phi i64 [%localday, %weekdayparse], [%engday, %englishday]
   %daymissing = icmp slt i64 %dayindex, 0
   br i1 %daymissing, label %mismatch, label %weekdayname
 weekdayname:
@@ -1137,6 +1545,13 @@ storefield:
   store i64 %fieldvalue, ptr %fieldp
   br label %loop
 ampmparse:
+  %localampm = call i64 @j_locale_parse(ptr %data, i64 %length, ptr %offset, i64 38, i64 2, i64 -1)
+  %haslocalampm = icmp sge i64 %localampm, 0
+  br i1 %haslocalampm, label %localampmstore, label %englishampm
+localampmstore:
+  store i64 %localampm, ptr %ampm
+  br label %ampmcontinue
+englishampm:
   %ap = load i64, ptr %offset
   %apend = add i64 %ap, 2
   %apshort = icmp ugt i64 %apend, %length
@@ -1158,6 +1573,8 @@ ampmstore:
   %half = zext i1 %ispm to i64
   store i64 %half, ptr %ampm
   store i64 %apend, ptr %offset
+  br label %ampmcontinue
+ampmcontinue:
   br label %loop
 specspace:
   %ss = load i64, ptr %offset
@@ -1229,6 +1646,11 @@ znend:
 zoneskip:
   br label %loop
 finish:
+  br i1 %fragment, label %fragmentdone, label %tailstart
+fragmentdone:
+  %fragmentvalue = call ptr @j_bool(i1 true)
+  ret ptr %fragmentvalue
+tailstart:
   %stop = load i64, ptr %offset
   %all = icmp eq i64 %stop, %length
   br i1 %all, label %build, label %tailcheck
@@ -1238,6 +1660,31 @@ tailcheck:
   %tailspace = call i1 @t_whitespace(i8 %tailc)
   br i1 %tailspace, label %build, label %mismatch
 build:
+  %centuryvalue = load i64, ptr %centuryp
+  %hascentury = icmp sge i64 %centuryvalue, 0
+  br i1 %hascentury, label %centurybuild, label %erabuildcheck
+centurybuild:
+  %rawyear = load i64, ptr %fields
+  %rawyear2 = srem i64 %rawyear, 100
+  %wantcentury = load i1, ptr %wantcenturyp
+  %yearwithincentury = select i1 %wantcentury, i64 %rawyear2, i64 0
+  %centurybase = mul i64 %centuryvalue, 100
+  %yearwithcentury = add i64 %centurybase, %yearwithincentury
+  store i64 %yearwithcentury, ptr %fields
+  br label %erabuildcheck
+erabuildcheck:
+  %selectedera = load ptr, ptr %eras
+  %hasselectedera = icmp ne ptr %selectedera, null
+  br i1 %hasselectedera, label %erabuild, label %hourbuild
+erabuild:
+  %wantyear = load i1, ptr %haserayearp
+  %raweryear = load i64, ptr %erayearp
+  %startingyear = load i64, ptr %selectedera
+  %effectiveerayear = select i1 %wantyear, i64 %raweryear, i64 %startingyear
+  %convertedyear = call i64 @j_locale_era_year(ptr %selectedera, i64 %effectiveerayear, i1 true)
+  store i64 %convertedyear, ptr %fields
+  br label %hourbuild
+hourbuild:
   %halfday = load i64, ptr %ampm
   %hashalf = icmp sge i64 %halfday, 0
   %hourp = getelementptr i64, ptr %fields, i64 3
@@ -1250,7 +1697,7 @@ build:
   %initial = call ptr @j_array()
   br label %fieldloop
 fieldloop:
-  %f = phi i64 [ 0, %build ], [ %fn, %fieldbody ]
+  %f = phi i64 [ 0, %hourbuild ], [ %fn, %fieldbody ]
   %fdone = icmp eq i64 %f, 6
   br i1 %fdone, label %normalize, label %fieldbody
 fieldbody:
@@ -1272,6 +1719,10 @@ appendtail:
 parsedone:
   ret ptr %result
 mismatch:
+  br i1 %fragment, label %fragmentfailed, label %diagnostic
+fragmentfailed:
+  ret ptr null
+diagnostic:
   %errbuffer = call ptr @j_buffer_new()
   call void @j_buffer_append(ptr %errbuffer, ptr @t.dateprefix, i64 6)
   %inputdata = call ptr @b_data(ptr %input)

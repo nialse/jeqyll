@@ -1381,10 +1381,15 @@ walk:
   %ws = call ptr @b_walk(ptr %ast, ptr %value, ptr %env)
   br label %mapped
 eval:
+  br i1 %preserve, label %evalfirst, label %evalall
+evalfirst:
+  %efs = call ptr @j_eval_take(ptr %ast, ptr %value, ptr %env, i64 1)
+  br label %mapped
+evalall:
   %es = call ptr @j_eval(ptr %ast, ptr %value, ptr %env)
   br label %mapped
 mapped:
-  %results = phi ptr [%ws, %walk], [%es, %eval]
+  %results = phi ptr [%ws, %walk], [%es, %evalall], [%efs, %evalfirst]
   br i1 %preserve, label %first, label %all
 first:
   %count = call i64 @b_len(ptr %results)

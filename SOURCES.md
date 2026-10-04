@@ -21,3 +21,56 @@ All implementation modules are handwritten LLVM IR. Upstream jq source is
 used as a behavioral reference. No upstream compiled
 code, generated implementation IR, interpreter or fallback executable is
 part of JEQY.
+
+The static ranges, property-name aliases and case-fold mappings in
+src/regex_unicode_data.ll are Unicode 16.0.0 and Emoji 16.0 data transcribed
+from vendor/oniguruma/src/unicode_property_data.c and unicode_fold_data.c
+at the pinned jq commit 579e6f76cffd7643ba4002a2c3618a5ea710589a.
+The table files identify versions UNICODE_PROPERTY_VERSION 160000,
+UNICODE_EMOJI_VERSION 1600 and UNICODE_CASEFOLD_VERSION 160000.
+Their BSD-2-Clause copyright notices and license are reproduced in
+licenses/UNICODE-TABLES.txt. Only numeric and name data were transcribed;
+all Unicode lookup and regex algorithms are independently handwritten IR.
+
+The mathematical recurrences in src/math_special.ll use the defining power
+series and asymptotic expansions recorded in the NIST Digital Library of
+Mathematical Functions, version 1.2.7: sections 5.11 (gamma), 7.9 (error
+function continued fraction), 10.8 and 10.17 (Bessel functions). These are
+independently handwritten formulas, not imported implementation code.
+References: https://dlmf.nist.gov/5.11, https://dlmf.nist.gov/7.9,
+https://dlmf.nist.gov/10.8, https://dlmf.nist.gov/10.17.
+
+src/timezone_posix.ll implements the TZ string grammar and transition
+interpretation specified by POSIX and RFC 9636, October 2024, section 3.3.
+Reference: https://www.rfc-editor.org/rfc/rfc9636.html#section-3.3.
+
+src/time_locale.ll and src/time_era.ll independently read serialized LC_TIME data and the
+locale archive format identified by GNU glibc's locale/localeinfo.h,
+locale/locarchive.h, and langinfo.h (glibc 2.42 data layout). These sources
+are data-format references only. No glibc implementation code, runtime
+symbols or bundled locale tables are used. The numeric item identifiers
+are also present in the host's public /usr/include/langinfo.h.
+The era records use eight 32-bit numeric fields followed by terminated narrow
+and wide name/format strings, as documented by localeinfo.h's era_entry layout
+and the serialized layout consumed by time/era.c. The reader, date selection,
+format recursion, and parse backtracking are independently handwritten IR.
+
+The 1152-bit 2/pi constant in src/math_trig.ll is the first 48 24-bit
+digits of the Sun fdlibm 1993 table preserved in FreeBSD's
+lib/msun/src/k_rem_pio2.c, retrieved 2026-09-09 from
+https://raw.githubusercontent.com/freebsd/freebsd-src/main/lib/msun/src/k_rem_pio2.c.
+The permissive notice is reproduced in licenses/FDLIBM-DATA.txt. Only this
+numeric constant was transcribed; the integer multiplication, bit extraction,
+compensated remainder, and series evaluation are original handwritten IR.
+
+src/regex_grapheme_data.ll similarly transcribes only the Unicode 16.0.0
+Grapheme_Cluster_Break numeric ranges from unicode_egcb_data.c in the same
+pinned source. Its GRAPHEME_BREAK_PROPERTY_VERSION is 160000 and its
+copyright and BSD-2-Clause terms are in licenses/UNICODE-TABLES.txt.
+
+The generator definitions in src/expand.ll and src/iterate.ll follow the
+language semantics of src/builtin.jq at the pinned jq commit. They construct
+ordinary JEQY AST nodes directly in handwritten IR; no jq source text is
+compiled, embedded as an implementation, or passed to another interpreter.
+Module resolution and reachable-definition validation use src/linker.c and
+src/compile.c from that commit as behavioral references only.
