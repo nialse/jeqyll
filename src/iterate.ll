@@ -42,6 +42,7 @@ declare ptr @j_clone(ptr)
 declare void @j_put(ptr, ptr, ptr)
 declare ptr @j_get(ptr, ptr)
 declare i32 @j_cmp(ptr, ptr)
+declare i1 @j_str_eq(ptr, ptr)
 declare i1 @j_is(ptr, ptr)
 declare i1 @j_truth(ptr)
 declare ptr @j_binary(i32, ptr, ptr)
@@ -1422,9 +1423,19 @@ handlercheck:
 breakhandler:
   br i1 %islabel, label %labelmatch, label %handlernext
 labelmatch:
-  %labelcmp = call i32 @j_cmp(ptr %labelname, ptr %broken)
-  %matchinglabel = icmp eq i32 %labelcmp, 0
+  %lcatag = load i32, ptr %labelname
+  %lbntag = load i32, ptr %broken
+  %lcastreq = icmp eq i32 %lcatag, 4
+  %lbntstreq = icmp eq i32 %lbntag, 4
+  %lcbothstr = and i1 %lcastreq, %lbntstreq
+  br i1 %lcbothstr, label %labelstreq, label %labelgen
+labelstreq:
+  %matchinglabel = call i1 @j_str_eq(ptr %labelname, ptr %broken)
   br i1 %matchinglabel, label %caughtbreak, label %handlernext
+labelgen:
+  %labelcmp = call i32 @j_cmp(ptr %labelname, ptr %broken)
+  %matchinglabel2 = icmp eq i32 %labelcmp, 0
+  br i1 %matchinglabel2, label %caughtbreak, label %handlernext
 errorhandler:
   br i1 %islabel, label %handlernext, label %caughterror
 handlernext:

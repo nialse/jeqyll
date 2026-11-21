@@ -84,6 +84,7 @@ declare void @j_put(ptr, ptr, ptr)
 declare ptr @j_get(ptr, ptr)
 declare ptr @j_clone(ptr)
 declare i32 @j_cmp(ptr, ptr)
+declare i1 @j_str_eq(ptr, ptr)
 declare i1 @j_truth(ptr)
 declare ptr @j_parse(ptr, i64, ptr)
 declare ptr @j_lex_number(ptr, i64, ptr)
@@ -1720,15 +1721,23 @@ loop:
   %done = icmp eq ptr %e, null
   br i1 %done, label %missing, label %check
 check:
-  %np = getelementptr %E, ptr %e, i32 0, i32 1
-  %n = load ptr, ptr %np
-  %cmp = call i32 @j_cmp(ptr %name, ptr %n)
-  %same = icmp eq i32 %cmp, 0
   %tp = getelementptr %E, ptr %e, i32 0, i32 3
   %t = load i32, ptr %tp
   %samekind = icmp eq i32 %t, %type
-  %both = and i1 %same, %samekind
-  br i1 %both, label %aritycheck, label %advance
+  br i1 %samekind, label %kindok, label %advance
+kindok:
+  %np = getelementptr %E, ptr %e, i32 0, i32 1
+  %n = load ptr, ptr %np
+  %ntag = load i32, ptr %n
+  %nstr = icmp eq i32 %ntag, 4
+  br i1 %nstr, label %streq, label %genname
+streq:
+  %same = call i1 @j_str_eq(ptr %name, ptr %n)
+  br i1 %same, label %aritycheck, label %advance
+genname:
+  %cmp = call i32 @j_cmp(ptr %name, ptr %n)
+  %samecmp = icmp eq i32 %cmp, 0
+  br i1 %samecmp, label %aritycheck, label %advance
 aritycheck:
   %function = icmp eq i32 %t, 1
   br i1 %function, label %countparams, label %found
@@ -2739,9 +2748,19 @@ label:
   %hasbreakname = icmp ne ptr %breakname, null
   br i1 %hasbreakname, label %labelcompare, label %labeldone
 labelcompare:
-  %labelcmp = call i32 @j_cmp(ptr %a, ptr %breakname)
-  %labelmatch = icmp eq i32 %labelcmp, 0
+  %lcatag = load i32, ptr %a
+  %lbntag = load i32, ptr %breakname
+  %lcastreq = icmp eq i32 %lcatag, 4
+  %lbntstreq = icmp eq i32 %lbntag, 4
+  %lcbothstr = and i1 %lcastreq, %lbntstreq
+  br i1 %lcbothstr, label %labelstreq, label %labelgen
+labelstreq:
+  %labelmatch = call i1 @j_str_eq(ptr %a, ptr %breakname)
   br i1 %labelmatch, label %labelclear, label %labeldone
+labelgen:
+  %labelcmp = call i32 @j_cmp(ptr %a, ptr %breakname)
+  %labelmatch2 = icmp eq i32 %labelcmp, 0
+  br i1 %labelmatch2, label %labelclear, label %labeldone
 labelclear:
   store ptr null, ptr @ev_break_name
   br label %labeldone
@@ -3475,8 +3494,22 @@ objbody:
   %ovidx = add i64 %oki, 1
   %ovp = getelementptr ptr, ptr %odata, i64 %ovidx
   %ov = load ptr, ptr %ovp
-  %same = call i32 @j_cmp(ptr %ok, ptr %key)
-  %remove = icmp eq i32 %same, 0
+  %odoktag = load i32, ptr %ok
+  %odkeytag = load i32, ptr %key
+  %odokeq = icmp eq i32 %odoktag, 4
+  %odkeyeq = icmp eq i32 %odkeytag, 4
+  %odbothstr = and i1 %odokeq, %odkeyeq
+  br i1 %odbothstr, label %odstreq, label %odgen
+odstreq:
+  %same = call i1 @j_str_eq(ptr %ok, ptr %key)
+  %samen = zext i1 %same to i32
+  br label %odmerge
+odgen:
+  %samecmp = call i32 @j_cmp(ptr %ok, ptr %key)
+  br label %odmerge
+odmerge:
+  %same2 = phi i32 [%samen, %odstreq], [%samecmp, %odgen]
+  %remove = icmp eq i32 %same2, 0
   br i1 %remove, label %objnext, label %objkeep
 objkeep:
   call void @j_put(ptr %odst, ptr %ok, ptr %ov)
