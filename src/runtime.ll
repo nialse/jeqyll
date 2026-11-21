@@ -610,11 +610,37 @@ error:
   ret void
 }
 
-define void @j_copy(ptr %dest, ptr %source, i64 %length) noinline optnone {
+; j_copy is a non-overlapping forward copy. It lowers to the memcpy intrinsic so
+; constant-size copies are expanded inline; variable sizes call @memcpy below.
+define void @j_copy(ptr %dest, ptr %source, i64 %length) alwaysinline {
 entry:
+  call void @llvm.memcpy.p0.p0.i64(ptr %dest, ptr %source, i64 %length, i1 false)
+  ret void
+}
+
+; The freestanding memory primitives are compiled with "no-builtins" so the
+; loop idiom recognizer cannot turn their loops back into self-calls. Bulk
+; work moves eight bytes per iteration and the tail is finished bytewise.
+define ptr @memcpy(ptr %dest, ptr %source, i64 %length) noinline #0 {
+entry:
+  %words = lshr i64 %length, 3
+  br label %wordloop
+wordloop:
+  %w = phi i64 [ 0, %entry ], [ %wnext, %wordbody ]
+  %wdone = icmp eq i64 %w, %words
+  br i1 %wdone, label %tailstart, label %wordbody
+wordbody:
+  %ws = getelementptr i64, ptr %source, i64 %w
+  %wd = getelementptr i64, ptr %dest, i64 %w
+  %wv = load i64, ptr %ws, align 1
+  store i64 %wv, ptr %wd, align 1
+  %wnext = add i64 %w, 1
+  br label %wordloop
+tailstart:
+  %tail = shl i64 %words, 3
   br label %loop
 loop:
-  %i = phi i64 [ 0, %entry ], [ %next, %body ]
+  %i = phi i64 [ %tail, %tailstart ], [ %next, %body ]
   %done = icmp uge i64 %i, %length
   br i1 %done, label %end, label %body
 body:
@@ -625,21 +651,30 @@ body:
   %next = add i64 %i, 1
   br label %loop
 end:
-  ret void
-}
-
-define ptr @memcpy(ptr %dest, ptr %source, i64 %length) noinline optnone {
-entry:
-  call void @j_copy(ptr %dest, ptr %source, i64 %length)
   ret ptr %dest
 }
 
-define ptr @memset(ptr %dest, i32 %value, i64 %length) noinline optnone {
+define ptr @memset(ptr %dest, i32 %value, i64 %length) noinline #0 {
 entry:
   %byte = trunc i32 %value to i8
+  %wide = zext i8 %byte to i64
+  %pattern = mul i64 %wide, 72340172838076673
+  %words = lshr i64 %length, 3
+  br label %wordloop
+wordloop:
+  %w = phi i64 [ 0, %entry ], [ %wnext, %wordbody ]
+  %wdone = icmp eq i64 %w, %words
+  br i1 %wdone, label %tailstart, label %wordbody
+wordbody:
+  %wd = getelementptr i64, ptr %dest, i64 %w
+  store i64 %pattern, ptr %wd, align 1
+  %wnext = add i64 %w, 1
+  br label %wordloop
+tailstart:
+  %tail = shl i64 %words, 3
   br label %loop
 loop:
-  %i = phi i64 [ 0, %entry ], [ %next, %body ]
+  %i = phi i64 [ %tail, %tailstart ], [ %next, %body ]
   %done = icmp uge i64 %i, %length
   br i1 %done, label %end, label %body
 body:
@@ -650,6 +685,10 @@ body:
 end:
   ret ptr %dest
 }
+
+declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+
+attributes #0 = { "no-builtins" }
 
 define ptr @j_null() {
   ret ptr @value_null
