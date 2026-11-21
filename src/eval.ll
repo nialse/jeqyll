@@ -3502,14 +3502,10 @@ objbody:
   br i1 %odbothstr, label %odstreq, label %odgen
 odstreq:
   %same = call i1 @j_str_eq(ptr %ok, ptr %key)
-  %samen = zext i1 %same to i32
-  br label %odmerge
+  br i1 %same, label %objnext, label %objkeep
 odgen:
   %samecmp = call i32 @j_cmp(ptr %ok, ptr %key)
-  br label %odmerge
-odmerge:
-  %same2 = phi i32 [%samen, %odstreq], [%samecmp, %odgen]
-  %remove = icmp eq i32 %same2, 0
+  %remove = icmp eq i32 %samecmp, 0
   br i1 %remove, label %objnext, label %objkeep
 objkeep:
   call void @j_put(ptr %odst, ptr %ok, ptr %ov)

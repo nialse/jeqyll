@@ -265,14 +265,10 @@ matchbody:
   br i1 %bothstr, label %pdstreq, label %pdgen
 pdstreq:
   %sameword = call i1 @j_str_eq(ptr %key, ptr %pathkey)
-  %sameword2 = zext i1 %sameword to i32
-  br label %matchcheck
+  br i1 %sameword, label %matchput, label %matchadvance
 pdgen:
   %cmp = call i32 @j_cmp(ptr %key, ptr %pathkey)
-  br label %matchcheck
-matchcheck:
-  %same2 = phi i32 [%sameword2, %pdstreq], [%cmp, %pdgen]
-  %match = icmp eq i32 %same2, 0
+  %match = icmp eq i32 %cmp, 0
   br i1 %match, label %matchput, label %matchadvance
 matchput:
   call void @j_push(ptr %matching, ptr %path)
