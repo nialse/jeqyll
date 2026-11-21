@@ -2365,6 +2365,7 @@ wrap:
 define internal void @buffer_uint(ptr %b, i64 %n) {
 entry:
   %digits = alloca [24 x i8]
+  %out = alloca [20 x i8]
   br label %loop
 loop:
   %v = phi i64 [ %n, %entry ], [ %quotient, %loop ]
@@ -2380,15 +2381,19 @@ loop:
   br i1 %done, label %reverse, label %loop
 reverse:
   %i = phi i64 [ %next, %loop ], [ %previous, %body ]
+  %outslot = phi i64 [ 0, %loop ], [ %outnext, %body ]
   %end = icmp eq i64 %i, 0
   br i1 %end, label %finish, label %body
 body:
   %previous = sub i64 %i, 1
   %p = getelementptr i8, ptr %digits, i64 %previous
   %c = load i8, ptr %p
-  call void @buffer_byte(ptr %b, i8 %c)
+  %op = getelementptr i8, ptr %out, i64 %outslot
+  store i8 %c, ptr %op
+  %outnext = add i64 %outslot, 1
   br label %reverse
 finish:
+  call void @buffer_append(ptr %b, ptr %out, i64 %outslot)
   ret void
 }
 
@@ -3678,20 +3683,26 @@ end:
 
 define internal void @dump_hex4(ptr %b, i32 %codepoint) {
 entry:
-  call void @buffer_byte(ptr %b, i8 92)
-  call void @buffer_byte(ptr %b, i8 117)
+  %buf = alloca [6 x i8]
+  store i8 92, ptr %buf
+  %up = getelementptr i8, ptr %buf, i64 1
+  store i8 117, ptr %up
   br label %loop
 loop:
   %shift = phi i32 [ 12, %entry ], [ %next, %loop ]
+  %slot = phi i64 [ 2, %entry ], [ %slotnext, %loop ]
   %part = lshr i32 %codepoint, %shift
   %hex = and i32 %part, 15
-  %p = getelementptr i8, ptr @hex_digits, i32 %hex
-  %c = load i8, ptr %p
-  call void @buffer_byte(ptr %b, i8 %c)
+  %hp = getelementptr i8, ptr @hex_digits, i32 %hex
+  %c = load i8, ptr %hp
+  %sp = getelementptr i8, ptr %buf, i64 %slot
+  store i8 %c, ptr %sp
+  %slotnext = add i64 %slot, 1
   %next = sub i32 %shift, 4
   %done = icmp eq i32 %shift, 0
-  br i1 %done, label %end, label %loop
-end:
+  br i1 %done, label %emit, label %loop
+emit:
+  call void @buffer_append(ptr %b, ptr %buf, i64 6)
   ret void
 }
 
