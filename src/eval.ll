@@ -1671,9 +1671,20 @@ validate:
   store ptr null, ptr @ev_validation_bindings
   %validationerror = load ptr, ptr @j_error
   %valid = icmp eq ptr %validationerror, null
-  br i1 %valid, label %returngood, label %returnerror
+  br i1 %valid, label %unwrapcheck, label %returnerror
+unwrapcheck:
+  %mkind = load i32, ptr %mainast
+  %misimport = icmp eq i32 %mkind, 24
+  %mopp = getelementptr %N, ptr %mainast, i32 0, i32 1
+  %mop = load i32, ptr %mopp
+  %mdead = icmp eq i32 %mop, -1
+  %munwrap = and i1 %misimport, %mdead
+  %mcp = getelementptr %N, ptr %mainast, i32 0, i32 4
+  %mchild = load ptr, ptr %mcp
+  %finalmain = select i1 %munwrap, ptr %mchild, ptr %mainast
+  br label %returngood
 returngood:
-  %result = phi ptr [%ast, %good], [%mainast, %validate]
+  %result = phi ptr [%ast, %good], [%finalmain, %unwrapcheck]
   store i64 %depth, ptr @ev_compile_depth
   ret ptr %result
 bad:
@@ -4406,6 +4417,11 @@ define ptr @ev_importenv(ptr %node, ptr %env, ptr %directory) {
 entry:
   %op.p = getelementptr %N, ptr %node, i32 0, i32 1
   %op = load i32, ptr %op.p
+  %skipped = icmp eq i32 %op, -1
+  br i1 %skipped, label %fastskip, label %startimport
+fastskip:
+  ret ptr %env
+startimport:
   %data = icmp eq i32 %op, 1
   %ap = getelementptr %N, ptr %node, i32 0, i32 2
   %path = load ptr, ptr %ap
@@ -4423,6 +4439,7 @@ entry:
 failed:
   br i1 %optional, label %ignore, label %report
 ignore:
+  store i32 -1, ptr %op.p
   store ptr null, ptr @j_error
   ret ptr %env
 report:
