@@ -2317,6 +2317,24 @@ copy:
 }
 
 define internal void @buffer_byte(ptr %b, i8 %c) {
+entry:
+  %lp0 = getelementptr %Buffer, ptr %b, i32 0, i32 1
+  %cp0 = getelementptr %Buffer, ptr %b, i32 0, i32 2
+  %oldlen = load i64, ptr %lp0
+  %cap = load i64, ptr %cp0
+  %need = add i64 %oldlen, 2
+  %fits = icmp ule i64 %need, %cap
+  br i1 %fits, label %fast, label %slow
+fast:
+  %dest = load ptr, ptr %b
+  %out = getelementptr i8, ptr %dest, i64 %oldlen
+  store i8 %c, ptr %out
+  %newlen = add i64 %oldlen, 1
+  store i64 %newlen, ptr %lp0
+  %end = getelementptr i8, ptr %dest, i64 %newlen
+  store i8 0, ptr %end
+  ret void
+slow:
   %p = alloca i8
   store i8 %c, ptr %p
   call void @buffer_append(ptr %b, ptr %p, i64 1)
@@ -2327,7 +2345,20 @@ define internal ptr @buffer_value(ptr %b) {
   %lp = getelementptr %Buffer, ptr %b, i32 0, i32 1
   %len = load i64, ptr %lp
   %data = load ptr, ptr %b
-  %v = call ptr @j_str(ptr %data, i64 %len)
+  %v = call ptr @j_alloc(i64 48)
+  store i32 4, ptr %v
+  %lpv = getelementptr %V, ptr %v, i32 0, i32 3
+  store i64 %len, ptr %lpv
+  %dpv = getelementptr %V, ptr %v, i32 0, i32 5
+  %empty = icmp eq ptr %data, null
+  br i1 %empty, label %fresh, label %wrap
+fresh:
+  %one = call ptr @j_alloc(i64 1)
+  store i8 0, ptr %one
+  store ptr %one, ptr %dpv
+  ret ptr %v
+wrap:
+  store ptr %data, ptr %dpv
   ret ptr %v
 }
 
@@ -3618,6 +3649,9 @@ finish:
   ret void
 }
 
+@spaces64 = private constant [64 x i8] c"                                                                "
+@tabs64 = private constant [64 x i8] c"\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09\09"
+
 define internal void @dump_indent(ptr %b, i32 %depth) {
 entry:
   call void @buffer_byte(ptr %b, i8 10)
@@ -3625,15 +3659,18 @@ entry:
   %tab = icmp slt i32 %width, 0
   %spaces = mul i32 %depth, %width
   %count = select i1 %tab, i32 %depth, i32 %spaces
-  %c = select i1 %tab, i8 9, i8 32
+  %count64 = sext i32 %count to i64
+  %pad = select i1 %tab, ptr @tabs64, ptr @spaces64
   br label %loop
 loop:
-  %i = phi i32 [ 0, %entry ], [ %next, %body ]
-  %done = icmp sge i32 %i, %count
+  %left = phi i64 [ %count64, %entry ], [ %remain, %body ]
+  %done = icmp sle i64 %left, 0
   br i1 %done, label %end, label %body
 body:
-  call void @buffer_byte(ptr %b, i8 %c)
-  %next = add i32 %i, 1
+  %full = icmp ugt i64 %left, 64
+  %chunk = select i1 %full, i64 64, i64 %left
+  call void @buffer_append(ptr %b, ptr %pad, i64 %chunk)
+  %remain = sub i64 %left, %chunk
   br label %loop
 end:
   ret void
@@ -3668,16 +3705,52 @@ entry:
   %ascii = icmp ne i32 %af, 0
   %offset = alloca i64
   call void @buffer_byte(ptr %b, i8 34)
-  br label %loop
-loop:
-  %i = phi i64 [ 0, %entry ], [ %next, %plain ], [ %next, %shortescape ], [ %next, %control ], [ %unext, %unicodeend ]
-  %done = icmp eq i64 %i, %length
-  br i1 %done, label %end, label %body
-body:
-  %p = getelementptr i8, ptr %data, i64 %i
+  br label %run
+run:
+  %i = phi i64 [ 0, %entry ], [ %enext, %shortescape ], [ %cnext, %controlend ], [ %unext, %unicodeend ]
+  br label %scan
+scan:
+  %j = phi i64 [ %i, %run ], [ %jn, %plainbyte ]
+  %done = icmp eq i64 %j, %length
+  br i1 %done, label %flush, label %fetch
+fetch:
+  %p = getelementptr i8, ptr %data, i64 %j
   %c = load i8, ptr %p
-  %next = add i64 %i, 1
-  switch i8 %c, label %ordinary [ i8 34, label %quote i8 92, label %slash i8 8, label %backspace i8 9, label %tab i8 10, label %newline i8 12, label %formfeed i8 13, label %return ]
+  %jn = add i64 %j, 1
+  %atleast = icmp uge i8 %c, 32
+  %atmost = icmp ule i8 %c, 126
+  %notquote = icmp ne i8 %c, 34
+  %notslash = icmp ne i8 %c, 92
+  %utf8 = icmp uge i8 %c, -128
+  %escapable = and i1 %ascii, %utf8
+  %notutf8esc = xor i1 %escapable, true
+  %inrange = and i1 %atleast, %atmost
+  %inrange2 = and i1 %inrange, %notquote
+  %plain = and i1 %inrange2, %notslash
+  %plain2 = and i1 %plain, %notutf8esc
+  %plainhigh = and i1 %utf8, %notutf8esc
+  %plain3 = or i1 %plain2, %plainhigh
+  br i1 %plain3, label %plainbyte, label %flush
+plainbyte:
+  br label %scan
+flush:
+  %runlen = sub i64 %j, %i
+  %have = icmp ugt i64 %runlen, 0
+  br i1 %have, label %append, label %atend
+append:
+  %rp = getelementptr i8, ptr %data, i64 %i
+  call void @buffer_append(ptr %b, ptr %rp, i64 %runlen)
+  br label %atend
+atend:
+  %atlast = icmp eq i64 %j, %length
+  br i1 %atlast, label %end, label %classify
+classify:
+  %cp0 = getelementptr i8, ptr %data, i64 %j
+  %c0 = load i8, ptr %cp0
+  %ishigh = icmp uge i8 %c0, -128
+  br i1 %ishigh, label %unicode, label %escswitch
+escswitch:
+  switch i8 %c0, label %control [ i8 34, label %quote i8 92, label %slash i8 8, label %backspace i8 9, label %tab i8 10, label %newline i8 12, label %formfeed i8 13, label %return ]
 quote:
   br label %shortescape
 slash:
@@ -3696,25 +3769,17 @@ shortescape:
   %esc = phi i8 [ 34, %quote ], [ 92, %slash ], [ 98, %backspace ], [ 116, %tab ], [ 110, %newline ], [ 102, %formfeed ], [ 114, %return ]
   call void @buffer_byte(ptr %b, i8 92)
   call void @buffer_byte(ptr %b, i8 %esc)
-  br label %loop
-ordinary:
-  %lowcontrol = icmp ult i8 %c, 32
-  %delete = icmp eq i8 %c, 127
-  %ctrl = or i1 %lowcontrol, %delete
-  br i1 %ctrl, label %control, label %unicodecheck
+  %enext = add i64 %j, 1
+  br label %run
+controlend:
+  %cnext = add i64 %j, 1
+  br label %run
 control:
-  %cc = zext i8 %c to i32
+  %cc = zext i8 %c0 to i32
   call void @dump_hex4(ptr %b, i32 %cc)
-  br label %loop
-unicodecheck:
-  %utf8 = icmp uge i8 %c, -128
-  %escapeunicode = and i1 %ascii, %utf8
-  br i1 %escapeunicode, label %unicode, label %plain
-plain:
-  call void @buffer_byte(ptr %b, i8 %c)
-  br label %loop
+  br label %controlend
 unicode:
-  store i64 %i, ptr %offset
+  store i64 %j, ptr %offset
   %cp = call i32 @j_utf8_next(ptr %data, i64 %length, ptr %offset)
   %unext = load i64, ptr %offset
   %pair = icmp uge i32 %cp, 65536
@@ -3732,7 +3797,7 @@ surrogates:
   call void @dump_hex4(ptr %b, i32 %ls)
   br label %unicodeend
 unicodeend:
-  br label %loop
+  br label %run
 end:
   call void @buffer_byte(ptr %b, i8 34)
   ret void
