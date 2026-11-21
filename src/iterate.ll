@@ -12,6 +12,7 @@
 @cli_halted = external global i1
 @j_deferred_input_error = external global ptr
 @j_gc_pressure = external global i64
+@j_gc_threshold = external global i64
 @j_collect_enabled = external global i1
 @g_next_depth = internal global i64 0
 @g_keyerror = private constant [33 x i8] c"Cannot use non-string object key\00"
@@ -334,7 +335,8 @@ loop:
   %enabled = load i1, ptr @j_collect_enabled
   %safe = and i1 %enabled, %toplevel
   %pressure = load i64, ptr @j_gc_pressure
-  %needed = icmp uge i64 %pressure, 8388608
+  %threshold = load i64, ptr @j_gc_threshold
+  %needed = icmp uge i64 %pressure, %threshold
   %collect = and i1 %safe, %needed
   br i1 %collect, label %collection, label %jobs
 collection:

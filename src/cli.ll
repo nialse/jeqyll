@@ -12,6 +12,8 @@
 @j_compile_error_end = external global i64
 @j_compile_env = external global ptr
 @j_compile_errors = external global ptr
+@j_gc_pressure = external global i64
+@j_gc_threshold = external global i64
 @j_compile_error_raw = external global i1
 @j_parse_error_offset = external global i64
 @j_parse_error_message = external global ptr
@@ -1452,7 +1454,15 @@ runloop:
   %stop = or i1 %halted, %outputfailed
   br i1 %stop, label %finish, label %runnext
 runnext:
+  %before_pressure = load i64, ptr @j_gc_pressure
   %in = call ptr @cli_take_next(i1 false)
+  %after_pressure = load i64, ptr @j_gc_pressure
+  %fresh_arena = icmp ult i64 %before_pressure, 8388608
+  %double_after = shl i64 %after_pressure, 1
+  %large_input = icmp ugt i64 %double_after, 8388608
+  %bump_thresh = and i1 %fresh_arena, %large_input
+  %new_thresh = select i1 %bump_thresh, i64 %double_after, i64 8388608
+  store i64 %new_thresh, ptr @j_gc_threshold
   %eof = icmp eq ptr %in, null
   br i1 %eof, label %inputend, label %evaluate
 inputend:

@@ -8,6 +8,8 @@
 @j_parse_error_eof = external global i1
 @j_parse_error_message = external global ptr
 @j_parse_error_path = external global ptr
+@in_scratch_data = internal global ptr null
+@in_scratch_cap = internal global i64 0
 @mtrt_errno_EINTR = external constant i32
 @in_dash = private constant [2 x i8] c"-\00"
 @in_stdin = private constant [8 x i8] c"<stdin>\00"
@@ -458,10 +460,34 @@ define internal void @in_error_here(ptr %reader, ptr %reason, i1 %eof) {
   ret void
 }
 
+define internal void @in_scratch_byte(i64 %index, i8 %byte) {
+entry:
+  %cap = load i64, ptr @in_scratch_cap
+  %need = add i64 %index, 2
+  %fits = icmp ule i64 %need, %cap
+  br i1 %fits, label %store, label %grow
+grow:
+  %twice = shl i64 %cap, 1
+  %small = icmp ult i64 %twice, 4096
+  %mincap = select i1 %small, i64 4096, i64 %twice
+  %larger = icmp ugt i64 %need, %mincap
+  %newcap = select i1 %larger, i64 %need, i64 %mincap
+  %newdata = call ptr @j_alloc_permanent(i64 %newcap)
+  %olddata = load ptr, ptr @in_scratch_data
+  call void @j_copy(ptr %newdata, ptr %olddata, i64 %index)
+  store ptr %newdata, ptr @in_scratch_data
+  store i64 %newcap, ptr @in_scratch_cap
+  br label %store
+store:
+  %data = load ptr, ptr @in_scratch_data
+  %slot = getelementptr i8, ptr %data, i64 %index
+  store i8 %byte, ptr %slot
+  ret void
+}
+
 ; Only one scalar token is buffered. Container state is independent of byte chunks.
 define internal ptr @in_token(ptr %reader) {
 entry:
-  %b = call ptr @j_buffer_new()
   %lp = getelementptr %Input, ptr %reader, i32 0, i32 8
   %cp = getelementptr %Input, ptr %reader, i32 0, i32 9
   %startline = load i64, ptr %lp
@@ -472,10 +498,11 @@ entry:
   br i1 %quoted, label %quoteopen, label %plain
 quoteopen:
   call void @in_take(ptr %reader, i32 34)
-  call void @j_buffer_byte(ptr %b, i8 34)
+  call void @in_scratch_byte(i64 0, i8 34)
   br label %string
 string:
   %escaped = phi i1 [ false, %quoteopen ], [ %nextescaped, %stringbyte ]
+  %slen = phi i64 [ 1, %quoteopen ], [ %nextslen, %stringbyte ]
   %sc = call i32 @in_peek(ptr %reader)
   %snegative = icmp slt i32 %sc, 0
   %srs = icmp eq i32 %sc, 30
@@ -485,7 +512,8 @@ string:
 stringbyte:
   call void @in_take(ptr %reader, i32 %sc)
   %sbyte = trunc i32 %sc to i8
-  call void @j_buffer_byte(ptr %b, i8 %sbyte)
+  call void @in_scratch_byte(i64 %slen, i8 %sbyte)
+  %nextslen = add i64 %slen, 1
   %slash = icmp eq i32 %sc, 92
   %unescaped = xor i1 %escaped, true
   %nextescaped = and i1 %slash, %unescaped
@@ -498,6 +526,7 @@ stringend:
   %sio = icmp eq i32 %sc, -2
   br i1 %sio, label %failure, label %parse
 plain:
+  %plen = phi i64 [ 0, %entry ], [ %nextplen, %plainbyte ]
   %pc = call i32 @in_peek(ptr %reader)
   %boundary = call i1 @in_boundary(i32 %pc)
   %prs = icmp eq i32 %pc, 30
@@ -507,27 +536,28 @@ plain:
 plainbyte:
   call void @in_take(ptr %reader, i32 %pc)
   %pbyte = trunc i32 %pc to i8
-  call void @j_buffer_byte(ptr %b, i8 %pbyte)
+  call void @in_scratch_byte(i64 %plen, i8 %pbyte)
+  %nextplen = add i64 %plen, 1
   br label %plain
 plainend:
   %pio = icmp eq i32 %pc, -2
   br i1 %pio, label %failure, label %parse
 parse:
   %terminator = phi i32 [ -3, %stringclosed ], [ %sc, %stringend ], [ %pc, %plainend ]
-  %token = call ptr @j_buffer_value(ptr %b)
-  %length = call i64 @in_len(ptr %token)
+  %length = phi i64 [ %nextslen, %stringclosed ], [ %slen, %stringend ], [ %plen, %plainend ]
   %realend = icmp sge i32 %terminator, 0
   %notrs = icmp ne i32 %terminator, 30
   %appendend = and i1 %realend, %notrs
   br i1 %appendend, label %delimiter, label %parsevalue
 delimiter:
   %delimiterbyte = trunc i32 %terminator to i8
-  call void @j_buffer_byte(ptr %b, i8 %delimiterbyte)
+  call void @in_scratch_byte(i64 %length, i8 %delimiterbyte)
+  %delimtotal = add i64 %length, 1
   br label %parsevalue
 parsevalue:
-  %fulltoken = call ptr @j_buffer_value(ptr %b)
-  %data = call ptr @in_data(ptr %fulltoken)
-  %total = call i64 @in_len(ptr %fulltoken)
+  %total = phi i64 [ %length, %parse ], [ %delimtotal, %delimiter ]
+  call void @in_scratch_byte(i64 %total, i8 0)
+  %data = load ptr, ptr @in_scratch_data
   %offset = alloca i64
   store i64 0, ptr %offset
   %prefixlength = call i64 @j_strlen(ptr %data)
