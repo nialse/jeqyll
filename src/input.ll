@@ -498,11 +498,47 @@ entry:
   br i1 %quoted, label %quoteopen, label %plain
 quoteopen:
   call void @in_take(ptr %reader, i32 34)
+  %qposp = getelementptr %Input, ptr %reader, i32 0, i32 6
+  %qendp = getelementptr %Input, ptr %reader, i32 0, i32 7
+  %qbufp = getelementptr %Input, ptr %reader, i32 0, i32 5
+  %qpos0 = load i64, ptr %qposp
+  %qend = load i64, ptr %qendp
+  %qbuf = load ptr, ptr %qbufp
+  br label %qfast
+qfast:
+  %qp = phi i64 [ %qpos0, %quoteopen ], [ %qpnext, %qfastnext ]
+  %qmore = icmp ult i64 %qp, %qend
+  br i1 %qmore, label %qfastbody, label %qfallback
+qfastbody:
+  %qptr = getelementptr i8, ptr %qbuf, i64 %qp
+  %qc = load i8, ptr %qptr
+  %qisquote = icmp eq i8 %qc, 34
+  br i1 %qisquote, label %qfastdone, label %qfastcheck
+qfastcheck:
+  %qisslash = icmp eq i8 %qc, 92
+  %qisspecial = icmp slt i8 %qc, 32
+  %qslow = or i1 %qisslash, %qisspecial
+  br i1 %qslow, label %qfallback, label %qfastnext
+qfastnext:
+  %qpnext = add i64 %qp, 1
+  br label %qfast
+qfastdone:
+  %qnewpos = add i64 %qp, 1
+  store i64 %qnewpos, ptr %qposp
+  %qlen = sub i64 %qp, %qpos0
+  %qcoladd = add i64 %qlen, 1
+  %qoldcol = load i64, ptr %cp
+  %qnewcol = add i64 %qoldcol, %qcoladd
+  store i64 %qnewcol, ptr %cp
+  %qstartptr = getelementptr i8, ptr %qbuf, i64 %qpos0
+  %qval = call ptr @j_str(ptr %qstartptr, i64 %qlen)
+  ret ptr %qval
+qfallback:
   call void @in_scratch_byte(i64 0, i8 34)
   br label %string
 string:
-  %escaped = phi i1 [ false, %quoteopen ], [ %nextescaped, %stringbyte ]
-  %slen = phi i64 [ 1, %quoteopen ], [ %nextslen, %stringbyte ]
+  %escaped = phi i1 [ false, %qfallback ], [ %nextescaped, %stringbyte ]
+  %slen = phi i64 [ 1, %qfallback ], [ %nextslen, %stringbyte ]
   %sc = call i32 @in_peek(ptr %reader)
   %snegative = icmp slt i32 %sc, 0
   %srs = icmp eq i32 %sc, 30
