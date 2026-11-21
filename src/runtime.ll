@@ -946,6 +946,61 @@ missing:
   ret ptr @value_null
 }
 
+define i1 @j_str_eq(ptr %a, ptr %b) {
+entry:
+  %same = icmp eq ptr %a, %b
+  br i1 %same, label %yes, label %checklen
+checklen:
+  %alp = getelementptr %V, ptr %a, i32 0, i32 3
+  %blp = getelementptr %V, ptr %b, i32 0, i32 3
+  %alen = load i64, ptr %alp
+  %blen = load i64, ptr %blp
+  %samelen = icmp eq i64 %alen, %blen
+  br i1 %samelen, label %checkbytes, label %no
+checkbytes:
+  %adp = getelementptr %V, ptr %a, i32 0, i32 5
+  %bdp = getelementptr %V, ptr %b, i32 0, i32 5
+  %adata = load ptr, ptr %adp
+  %bdata = load ptr, ptr %bdp
+  %words = lshr i64 %alen, 3
+  br label %wordloop
+wordloop:
+  %w = phi i64 [ 0, %checkbytes ], [ %wnext, %wordnext ]
+  %wdone = icmp eq i64 %w, %words
+  br i1 %wdone, label %tailstart, label %wordbody
+wordbody:
+  %wa = getelementptr i64, ptr %adata, i64 %w
+  %wb = getelementptr i64, ptr %bdata, i64 %w
+  %av = load i64, ptr %wa, align 1
+  %bv = load i64, ptr %wb, align 1
+  %weq = icmp eq i64 %av, %bv
+  br i1 %weq, label %wordnext, label %no
+wordnext:
+  %wnext = add i64 %w, 1
+  br label %wordloop
+tailstart:
+  %tail = shl i64 %words, 3
+  br label %tailloop
+tailloop:
+  %i = phi i64 [ %tail, %tailstart ], [ %inext, %tailnext ]
+  %tdone = icmp eq i64 %i, %alen
+  br i1 %tdone, label %yes, label %tailbody
+tailbody:
+  %pa = getelementptr i8, ptr %adata, i64 %i
+  %pb = getelementptr i8, ptr %bdata, i64 %i
+  %ca = load i8, ptr %pa
+  %cb = load i8, ptr %pb
+  %ceq = icmp eq i8 %ca, %cb
+  br i1 %ceq, label %tailnext, label %no
+tailnext:
+  %inext = add i64 %i, 1
+  br label %tailloop
+yes:
+  ret i1 true
+no:
+  ret i1 false
+}
+
 define void @j_put(ptr %object, ptr %key, ptr %value) {
 entry:
   %tag = load i32, ptr %key
@@ -968,8 +1023,7 @@ body:
   %ki = mul i64 %i, 2
   %kp = getelementptr ptr, ptr %data, i64 %ki
   %k = load ptr, ptr %kp
-  %cmp = call i32 @j_cmp(ptr %k, ptr %key)
-  %equal = icmp eq i32 %cmp, 0
+  %equal = call i1 @j_str_eq(ptr %k, ptr %key)
   br i1 %equal, label %replace, label %advance
 advance:
   %next = add i64 %i, 1
@@ -1027,8 +1081,7 @@ body:
   %ki = mul i64 %i, 2
   %kp = getelementptr ptr, ptr %data, i64 %ki
   %k = load ptr, ptr %kp
-  %cmp = call i32 @j_cmp(ptr %k, ptr %key)
-  %equal = icmp eq i32 %cmp, 0
+  %equal = call i1 @j_str_eq(ptr %k, ptr %key)
   br i1 %equal, label %found, label %advance
 advance:
   %next = add i64 %i, 1
@@ -1157,6 +1210,13 @@ tagorder:
 dispatch:
   switch i32 %lt, label %equal [ i32 3, label %numbers i32 4, label %strings i32 5, label %arrays i32 6, label %objects ]
 numbers:
+  %lnp = getelementptr %V, ptr %left, i32 0, i32 2
+  %rnp = getelementptr %V, ptr %right, i32 0, i32 2
+  %ln = load double, ptr %lnp
+  %rn = load double, ptr %rnp
+  %ne = fcmp oeq double %ln, %rn
+  br i1 %ne, label %numequal, label %numdiff
+numequal:
   %llitp = getelementptr %V, ptr %left, i32 0, i32 6
   %rlitp = getelementptr %V, ptr %right, i32 0, i32 6
   %llit = load ptr, ptr %llitp
@@ -1164,20 +1224,14 @@ numbers:
   %ldec = icmp ne ptr %llit, null
   %rdec = icmp ne ptr %rlit, null
   %bothdecimal = and i1 %ldec, %rdec
-  br i1 %bothdecimal, label %decimalnumbers, label %binarynumbers
+  br i1 %bothdecimal, label %decimalnumbers, label %equal
 decimalnumbers:
   %dc = call i32 @decimal_compare(ptr %llit, ptr %rlit)
   ret i32 %dc
-binarynumbers:
-  %lnp = getelementptr %V, ptr %left, i32 0, i32 2
-  %rnp = getelementptr %V, ptr %right, i32 0, i32 2
-  %ln = load double, ptr %lnp
-  %rn = load double, ptr %rnp
-  %ne = fcmp oeq double %ln, %rn
+numdiff:
   %nl = fcmp ult double %ln, %rn
   %no = select i1 %nl, i32 -1, i32 1
-  %nr = select i1 %ne, i32 0, i32 %no
-  ret i32 %nr
+  ret i32 %no
 strings:
   %llp = getelementptr %V, ptr %left, i32 0, i32 3
   %rlp = getelementptr %V, ptr %right, i32 0, i32 3
@@ -4509,6 +4563,13 @@ end:
 
 define internal i32 @decimal_compare(ptr %left, ptr %right) {
 entry:
+  %same = icmp eq ptr %left, %right
+  br i1 %same, label %sameptr, label %start
+sameptr:
+  ret i32 0
+start:
+  %mark = alloca %ArenaMark
+  call void @j_arena_mark(ptr %mark)
   %a = call ptr @decimal_parts(ptr %left)
   %b = call ptr @decimal_parts(ptr %right)
   %as = load i32, ptr %a
@@ -4518,6 +4579,7 @@ entry:
 signorder:
   %signless = icmp slt i32 %as, %bs
   %signresult = select i1 %signless, i32 -1, i32 1
+  call void @j_arena_rewind(ptr %mark)
   ret i32 %signresult
 zerocheck:
   %zero = icmp eq i32 %as, 0
@@ -4533,6 +4595,7 @@ positionorder:
   %positionless = icmp slt i64 %ax, %bx
   %positioncmp = select i1 %positionless, i32 -1, i32 1
   %positionresult = mul i32 %positioncmp, %as
+  call void @j_arena_rewind(ptr %mark)
   ret i32 %positionresult
 digits:
   %alp = getelementptr %Decimal, ptr %a, i32 0, i32 2
@@ -4580,8 +4643,10 @@ different:
   %less = icmp ult i8 %av, %bv
   %cmp = select i1 %less, i32 -1, i32 1
   %result = mul i32 %cmp, %as
+  call void @j_arena_rewind(ptr %mark)
   ret i32 %result
 equal:
+  call void @j_arena_rewind(ptr %mark)
   ret i32 0
 }
 

@@ -46,6 +46,10 @@
 @b.errcontain = private constant [46 x i8] c"cannot have their containment checked\00\00\00\00\00\00\00\00\00"
 
 declare ptr @j_alloc(i64)
+declare void @j_arena_mark(ptr)
+declare void @j_arena_rewind(ptr)
+declare void @j_copy(ptr, ptr, i64)
+declare i1 @j_str_eq(ptr, ptr)
 declare ptr @j_null()
 declare ptr @j_bool(i1)
 declare ptr @j_num(double)
@@ -327,7 +331,8 @@ entry:
   %vd = call ptr @b_data(ptr %values)
   %kd = call ptr @b_data(ptr %keys)
   %same = icmp eq ptr %values, %keys
-  br label %outer
+  %small = icmp sle i64 %n, 16
+  br i1 %small, label %outer, label %mergestart
 outer:
   %i = phi i64 [1, %entry], [%inext, %insert]
   %more = icmp slt i64 %i, %n
@@ -364,6 +369,105 @@ insert:
   store ptr %key, ptr %destkp
   %inext = add i64 %i, 1
   br label %outer
+mergestart:
+  %mark = alloca [3 x i64]
+  %errbefore = load ptr, ptr @j_error
+  call void @j_arena_mark(ptr %mark)
+  %bytes = shl i64 %n, 3
+  %tv = call ptr @j_alloc(i64 %bytes)
+  br i1 %same, label %mergesame, label %mergediff
+mergesame:
+  br label %passloop
+mergediff:
+  %tkalloc = call ptr @j_alloc(i64 %bytes)
+  br label %passloop
+passloop:
+  %tk = phi ptr [%tv, %mergesame], [%tkalloc, %mergediff], [%tk, %passnext]
+  %width = phi i64 [1, %mergesame], [1, %mergediff], [%nextwidth, %passnext]
+  %passmore = icmp slt i64 %width, %n
+  br i1 %passmore, label %chunkloop, label %mergedone
+chunkloop:
+  %left = phi i64 [0, %passloop], [%nextleft, %chunkdone]
+  %chunkmore = icmp slt i64 %left, %n
+  br i1 %chunkmore, label %chunksetup, label %passcopy
+chunksetup:
+  %mid0 = add i64 %left, %width
+  %midlt = icmp slt i64 %mid0, %n
+  %mid = select i1 %midlt, i64 %mid0, i64 %n
+  %step = shl i64 %width, 1
+  %right0 = add i64 %left, %step
+  %rightlt = icmp slt i64 %right0, %n
+  %right = select i1 %rightlt, i64 %right0, i64 %n
+  br label %mergeloop
+mergeloop:
+  %l = phi i64 [%left, %chunksetup], [%lnext, %mergestorenext]
+  %r = phi i64 [%mid, %chunksetup], [%rnext, %mergestorenext]
+  %outidx = phi i64 [%left, %chunksetup], [%outnext, %mergestorenext]
+  %hasl = icmp slt i64 %l, %mid
+  %hasr = icmp slt i64 %r, %right
+  %both = and i1 %hasl, %hasr
+  br i1 %both, label %mergecmp, label %mergeone
+mergecmp:
+  %lkp = getelementptr ptr, ptr %kd, i64 %l
+  %rkp = getelementptr ptr, ptr %kd, i64 %r
+  %lk = load ptr, ptr %lkp
+  %rk = load ptr, ptr %rkp
+  %mc = call i32 @j_cmp(ptr %lk, ptr %rk)
+  %takel = icmp sle i32 %mc, 0
+  br i1 %takel, label %fromleft, label %fromright
+mergeone:
+  %any = or i1 %hasl, %hasr
+  br i1 %any, label %pickone, label %chunkdone
+pickone:
+  br i1 %hasl, label %fromleft, label %fromright
+fromleft:
+  %lvp = getelementptr ptr, ptr %vd, i64 %l
+  %lv = load ptr, ptr %lvp
+  %lkp2 = getelementptr ptr, ptr %kd, i64 %l
+  %lk2 = load ptr, ptr %lkp2
+  %linc = add i64 %l, 1
+  br label %mergestore
+fromright:
+  %rvp = getelementptr ptr, ptr %vd, i64 %r
+  %rv = load ptr, ptr %rvp
+  %rkp2 = getelementptr ptr, ptr %kd, i64 %r
+  %rk2 = load ptr, ptr %rkp2
+  %rinc = add i64 %r, 1
+  br label %mergestore
+mergestore:
+  %pickedv = phi ptr [%lv, %fromleft], [%rv, %fromright]
+  %pickedk = phi ptr [%lk2, %fromleft], [%rk2, %fromright]
+  %lnext = phi i64 [%linc, %fromleft], [%l, %fromright]
+  %rnext = phi i64 [%r, %fromleft], [%rinc, %fromright]
+  %tvslot = getelementptr ptr, ptr %tv, i64 %outidx
+  store ptr %pickedv, ptr %tvslot
+  br i1 %same, label %mergestorenext, label %mergestorekey
+mergestorekey:
+  %tkslot = getelementptr ptr, ptr %tk, i64 %outidx
+  store ptr %pickedk, ptr %tkslot
+  br label %mergestorenext
+mergestorenext:
+  %outnext = add i64 %outidx, 1
+  br label %mergeloop
+chunkdone:
+  %nextleft = add i64 %left, %step
+  br label %chunkloop
+passcopy:
+  call void @j_copy(ptr %vd, ptr %tv, i64 %bytes)
+  br i1 %same, label %passnext, label %passcopykey
+passcopykey:
+  call void @j_copy(ptr %kd, ptr %tk, i64 %bytes)
+  br label %passnext
+passnext:
+  %nextwidth = shl i64 %width, 1
+  br label %passloop
+mergedone:
+  %errafter = load ptr, ptr @j_error
+  %noerr = icmp eq ptr %errafter, %errbefore
+  br i1 %noerr, label %mergerewind, label %done
+mergerewind:
+  call void @j_arena_rewind(ptr %mark)
+  br label %done
 done:
   ret void
 }
@@ -544,8 +648,7 @@ body:
   %ix = shl i64 %i, 1
   %p = getelementptr ptr, ptr %d, i64 %ix
   %k = load ptr, ptr %p
-  %cmp = call i32 @j_cmp(ptr %k, ptr %key)
-  %eq = icmp eq i32 %cmp, 0
+  %eq = call i1 @j_str_eq(ptr %k, ptr %key)
   %next = add i64 %i, 1
   br i1 %eq, label %yes, label %loop
 yes:
@@ -1458,31 +1561,79 @@ bad:
   ret ptr %empty
 start:
   %values = call ptr @j_clone(ptr %input)
+  %n = call i64 @b_len(ptr %input)
+  %isgroup = icmp eq i32 %id, 29
+  %isuniq0 = icmp eq i32 %id, 30
+  %isuniq1 = icmp eq i32 %id, 31
+  %isuniq = or i1 %isuniq0, %isuniq1
+  %needflags = or i1 %isgroup, %isuniq
+  %flagsize = select i1 %needflags, i64 %n, i64 0
+  %flags = call ptr @j_alloc(i64 %flagsize)
+  %mark = alloca [3 x i64]
+  %errbefore = load ptr, ptr @j_error
+  call void @j_arena_mark(ptr %mark)
   %argc = call i64 @b_len(ptr %args)
   %haskey = icmp sgt i64 %argc, 0
-  %keys = call ptr @j_array()
-  %n = call i64 @b_len(ptr %input)
+  br i1 %haskey, label %makekeys, label %nokeys
+makekeys:
+  %keysalloc = call ptr @j_array()
   br label %keyloop
 keyloop:
-  %i = phi i64 [0, %start], [%next, %keyappend]
+  %i = phi i64 [0, %makekeys], [%next, %keyappend]
   %more = icmp slt i64 %i, %n
   br i1 %more, label %keybody, label %sort
 keybody:
   %v = call ptr @j_at(ptr %input, i64 %i)
-  br i1 %haskey, label %eval, label %identity
-eval:
   %s = call ptr @b_arg(ptr %args, i64 0, ptr %v, ptr %env)
-  br label %keyappend
-identity:
-  br label %keyappend
+  %keyerr = load ptr, ptr @j_error
+  %keybad = icmp ne ptr %keyerr, %errbefore
+  br i1 %keybad, label %abort, label %keyappend
 keyappend:
-  %k = phi ptr [%s, %eval], [%v, %identity]
-  call void @j_push(ptr %keys, ptr %k)
+  call void @j_push(ptr %keysalloc, ptr %s)
   %next = add i64 %i, 1
   br label %keyloop
+nokeys:
+  br label %sort
 sort:
+  %keys = phi ptr [%keysalloc, %keyloop], [%values, %nokeys]
   call void @b_sort_inplace(ptr %values, ptr %keys)
-  switch i32 %id, label %sorted [i32 29, label %group i32 30, label %unique i32 31, label %unique i32 32, label %min i32 33, label %max i32 34, label %min i32 35, label %max]
+  br i1 %needflags, label %flagstart, label %rewindcheck
+flagstart:
+  %kd = call ptr @b_data(ptr %keys)
+  br label %flagloop
+flagloop:
+  %fi = phi i64 [0, %flagstart], [%finext, %flagstore]
+  %fprev = phi ptr [null, %flagstart], [%fcur, %flagstore]
+  %fmore = icmp slt i64 %fi, %n
+  br i1 %fmore, label %flagbody, label %rewindcheck
+flagbody:
+  %fkp = getelementptr ptr, ptr %kd, i64 %fi
+  %fcur = load ptr, ptr %fkp
+  %ffirst = icmp eq i64 %fi, 0
+  br i1 %ffirst, label %flagnew, label %flagcmp
+flagcmp:
+  %fc = call i32 @j_cmp(ptr %fprev, ptr %fcur)
+  %fsame = icmp eq i32 %fc, 0
+  %fbit = select i1 %fsame, i8 0, i8 1
+  br label %flagstore
+flagnew:
+  br label %flagstore
+flagstore:
+  %fval = phi i8 [1, %flagnew], [%fbit, %flagcmp]
+  %fslot = getelementptr i8, ptr %flags, i64 %fi
+  store i8 %fval, ptr %fslot
+  %finext = add i64 %fi, 1
+  br label %flagloop
+rewindcheck:
+  %errafter = load ptr, ptr @j_error
+  %clean = icmp eq ptr %errafter, %errbefore
+  br i1 %clean, label %dorewind, label %abort
+dorewind:
+  call void @j_arena_rewind(ptr %mark)
+  switch i32 %id, label %sorted [i32 29, label %dedup i32 30, label %dedup i32 31, label %dedup i32 32, label %min i32 33, label %max i32 34, label %min i32 35, label %max]
+abort:
+  %emptyabort = call ptr @j_array()
+  ret ptr %emptyabort
 sorted:
   %sr = call ptr @b_one(ptr %values)
   ret ptr %sr
@@ -1494,10 +1645,6 @@ max:
   %maxv = call ptr @j_at(ptr %values, i64 -1)
   %maxr = call ptr @b_one(ptr %maxv)
   ret ptr %maxr
-group:
-  br label %dedup
-unique:
-  br label %dedup
 dedup:
   %groups = icmp eq i32 %id, 29
   %out = call ptr @j_array()
@@ -1505,19 +1652,15 @@ dedup:
   br label %loop
 loop:
   %j = phi i64 [0, %dedup], [%jnext, %advance]
-  %prevkey = phi ptr [null, %dedup], [%curkey, %advance]
   %curgroup = phi ptr [%firstgroup, %dedup], [%nextgroup, %advance]
   %jmore = icmp slt i64 %j, %n
   br i1 %jmore, label %body, label %done
 body:
-  %curkey = call ptr @j_at(ptr %keys, i64 %j)
   %curval = call ptr @j_at(ptr %values, i64 %j)
-  %first = icmp eq i64 %j, 0
-  br i1 %first, label %newgroup, label %compare
-compare:
-  %cmp = call i32 @j_cmp(ptr %prevkey, ptr %curkey)
-  %same = icmp eq i32 %cmp, 0
-  br i1 %same, label %existing, label %newgroup
+  %flagp = getelementptr i8, ptr %flags, i64 %j
+  %flagv = load i8, ptr %flagp
+  %isnew = icmp ne i8 %flagv, 0
+  br i1 %isnew, label %newgroup, label %existing
 newgroup:
   br i1 %groups, label %makegroup, label %newvalue
 makegroup:
