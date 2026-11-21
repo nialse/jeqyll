@@ -29,6 +29,8 @@
 @rx_zero = private constant [2 x i8] c"0\00"
 
 declare ptr @j_alloc(i64)
+declare void @j_arena_mark(ptr)
+declare void @j_arena_rewind(ptr)
 declare void @j_copy(ptr, ptr, i64)
 declare i64 @rx_capture_bytes(ptr)
 declare i64 @rx_max_width(ptr, i64, i32)
@@ -1028,6 +1030,9 @@ entry:
   %over = icmp ugt i64 %depth, 8192
   br i1 %over, label %resource, label %initialize
 initialize:
+  %runmark = alloca [3 x i64]
+  %runerr0 = load ptr, ptr @j_error
+  call void @j_arena_mark(ptr %runmark)
   %cursor = alloca ptr
   %position = alloca i64
   %choices = alloca ptr
@@ -1437,6 +1442,13 @@ finishkeep:
   store i64 %finalkeep, ptr %finalkeepp
   br label %done
 done:
+  %runerr1 = load ptr, ptr @j_error
+  %runclean = icmp eq ptr %runerr1, %runerr0
+  br i1 %runclean, label %rewindrun, label %retfinal
+rewindrun:
+  call void @j_arena_rewind(ptr %runmark)
+  br label %retfinal
+retfinal:
   ret i64 %finalend
 }
 
