@@ -85,6 +85,7 @@ declare ptr @j_get(ptr, ptr)
 declare ptr @j_clone(ptr)
 declare i32 @j_cmp(ptr, ptr)
 declare i1 @j_str_eq(ptr, ptr)
+declare ptr @g_try_fast(ptr, ptr, ptr)
 declare i1 @j_truth(ptr)
 declare ptr @j_parse(ptr, i64, ptr)
 declare ptr @j_lex_number(ptr, i64, ptr)
@@ -3658,8 +3659,101 @@ done:
   ret i64 %floor
 }
 
+define ptr @ev_try_fast_assign(ptr %lhs, ptr %rhs, i32 %op, ptr %input, ptr %env) {
+entry:
+  %nullin = icmp eq ptr %input, null
+  %nulllhs = icmp eq ptr %lhs, null
+  %nullrhs = icmp eq ptr %rhs, null
+  %null0 = or i1 %nullin, %nulllhs
+  %nullany = or i1 %null0, %nullrhs
+  br i1 %nullany, label %fail, label %checkop
+checkop:
+  %itag = load i32, ptr %input
+  %iobj = icmp eq i32 %itag, 6
+  %isupd = icmp eq i32 %op, 265
+  %isset = icmp eq i32 %op, 61
+  %opok = or i1 %isupd, %isset
+  %ok0 = and i1 %iobj, %opok
+  br i1 %ok0, label %checklhs, label %fail
+checklhs:
+  %lkind = load i32, ptr %lhs
+  %lisfld = icmp eq i32 %lkind, 5
+  br i1 %lisfld, label %checkkey1, label %fail
+checkkey1:
+  %lap = getelementptr %N, ptr %lhs, i32 0, i32 2
+  %la = load ptr, ptr %lap
+  %lbp = getelementptr %N, ptr %lhs, i32 0, i32 3
+  %lb = load ptr, ptr %lbp
+  %lbkind = load i32, ptr %lb
+  %lblit = icmp eq i32 %lbkind, 0
+  br i1 %lblit, label %loadkey1, label %fail
+loadkey1:
+  %k1p = getelementptr %N, ptr %lb, i32 0, i32 2
+  %k1 = load ptr, ptr %k1p
+  %k1tag = load i32, ptr %k1
+  %k1str = icmp eq i32 %k1tag, 4
+  br i1 %k1str, label %checkbase, label %fail
+checkbase:
+  %lakind = load i32, ptr %la
+  switch i32 %lakind, label %fail [ i32 1, label %level1 i32 5, label %level2 ]
+level1:
+  %old1 = call ptr @j_get(ptr %input, ptr %k1)
+  %rin1 = select i1 %isupd, ptr %old1, ptr %input
+  %new1 = call ptr @g_try_fast(ptr %rhs, ptr %rin1, ptr %env)
+  %ok1 = icmp ne ptr %new1, null
+  br i1 %ok1, label %apply1, label %fail
+apply1:
+  %cp1 = call ptr @j_clone(ptr %input)
+  call void @j_put(ptr %cp1, ptr %k1, ptr %new1)
+  ret ptr %cp1
+level2:
+  %laap = getelementptr %N, ptr %la, i32 0, i32 2
+  %laa = load ptr, ptr %laap
+  %labp = getelementptr %N, ptr %la, i32 0, i32 3
+  %lab = load ptr, ptr %labp
+  %laakind = load i32, ptr %laa
+  %laaid = icmp eq i32 %laakind, 1
+  %labkind = load i32, ptr %lab
+  %lablit = icmp eq i32 %labkind, 0
+  %l2ok = and i1 %laaid, %lablit
+  br i1 %l2ok, label %loadkey0, label %fail
+loadkey0:
+  %k0p = getelementptr %N, ptr %lab, i32 0, i32 2
+  %k0 = load ptr, ptr %k0p
+  %k0tag = load i32, ptr %k0
+  %k0str = icmp eq i32 %k0tag, 4
+  br i1 %k0str, label %getmid, label %fail
+getmid:
+  %mid = call ptr @j_get(ptr %input, ptr %k0)
+  %midtag = load i32, ptr %mid
+  %midobj = icmp eq i32 %midtag, 6
+  br i1 %midobj, label %eval2, label %fail
+eval2:
+  %old2 = call ptr @j_get(ptr %mid, ptr %k1)
+  %rin2 = select i1 %isupd, ptr %old2, ptr %input
+  %new2 = call ptr @g_try_fast(ptr %rhs, ptr %rin2, ptr %env)
+  %ok2 = icmp ne ptr %new2, null
+  br i1 %ok2, label %apply2, label %fail
+apply2:
+  %midcp = call ptr @j_clone(ptr %mid)
+  call void @j_put(ptr %midcp, ptr %k1, ptr %new2)
+  %cp2 = call ptr @j_clone(ptr %input)
+  call void @j_put(ptr %cp2, ptr %k0, ptr %midcp)
+  ret ptr %cp2
+fail:
+  ret ptr null
+}
+
 define internal ptr @ev_assignment(ptr %lhs, ptr %rhs, i32 %op, ptr %input, ptr %env) {
 entry:
+  %fast = call ptr @ev_try_fast_assign(ptr %lhs, ptr %rhs, i32 %op, ptr %input, ptr %env)
+  %hasfast = icmp ne ptr %fast, null
+  br i1 %hasfast, label %fastdone, label %slowentry
+fastdone:
+  %fastout = call ptr @j_array()
+  call void @j_push(ptr %fastout, ptr %fast)
+  ret ptr %fastout
+slowentry:
   store ptr null, ptr @ev_invalid_path_value
   store i1 false, ptr @ev_invalid_path_detailed
   %out = call ptr @j_array()

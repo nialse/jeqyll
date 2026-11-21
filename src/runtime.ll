@@ -962,10 +962,52 @@ checkbytes:
   %bdp = getelementptr %V, ptr %b, i32 0, i32 5
   %adata = load ptr, ptr %adp
   %bdata = load ptr, ptr %bdp
+  %short = icmp ule i64 %alen, 8
+  br i1 %short, label %shortcheck, label %longcheck
+shortcheck:
+  %ge4 = icmp uge i64 %alen, 4
+  br i1 %ge4, label %short4to8, label %short0to3
+short4to8:
+  %last4 = sub i64 %alen, 4
+  %a0 = load i32, ptr %adata, align 1
+  %b0 = load i32, ptr %bdata, align 1
+  %ap4 = getelementptr i8, ptr %adata, i64 %last4
+  %bp4 = getelementptr i8, ptr %bdata, i64 %last4
+  %a1 = load i32, ptr %ap4, align 1
+  %b1 = load i32, ptr %bp4, align 1
+  %x0 = xor i32 %a0, %b0
+  %x1 = xor i32 %a1, %b1
+  %x48 = or i32 %x0, %x1
+  %eq48 = icmp eq i32 %x48, 0
+  ret i1 %eq48
+short0to3:
+  %empty = icmp eq i64 %alen, 0
+  br i1 %empty, label %yes, label %short1to3
+short1to3:
+  %mid = lshr i64 %alen, 1
+  %last1 = sub i64 %alen, 1
+  %sa0 = load i8, ptr %adata
+  %sb0 = load i8, ptr %bdata
+  %sam = getelementptr i8, ptr %adata, i64 %mid
+  %sbm = getelementptr i8, ptr %bdata, i64 %mid
+  %sa1 = load i8, ptr %sam
+  %sb1 = load i8, ptr %sbm
+  %sal = getelementptr i8, ptr %adata, i64 %last1
+  %sbl = getelementptr i8, ptr %bdata, i64 %last1
+  %sa2 = load i8, ptr %sal
+  %sb2 = load i8, ptr %sbl
+  %sx0 = xor i8 %sa0, %sb0
+  %sx1 = xor i8 %sa1, %sb1
+  %sx2 = xor i8 %sa2, %sb2
+  %sx01 = or i8 %sx0, %sx1
+  %sx = or i8 %sx01, %sx2
+  %eq13 = icmp eq i8 %sx, 0
+  ret i1 %eq13
+longcheck:
   %words = lshr i64 %alen, 3
   br label %wordloop
 wordloop:
-  %w = phi i64 [ 0, %checkbytes ], [ %wnext, %wordnext ]
+  %w = phi i64 [ 0, %longcheck ], [ %wnext, %wordnext ]
   %wdone = icmp eq i64 %w, %words
   br i1 %wdone, label %tailstart, label %wordbody
 wordbody:
@@ -1109,13 +1151,15 @@ copy:
   %cp = getelementptr %V, ptr %v, i32 0, i32 4
   %dp = getelementptr %V, ptr %v, i32 0, i32 5
   %len = load i64, ptr %lp
+  %newcap = add i64 %len, 2
   %isobj = icmp eq i32 %tag, 6
   %width = select i1 %isobj, i64 16, i64 8
   %bytes = mul i64 %len, %width
+  %allocbytes = mul i64 %newcap, %width
   %data = load ptr, ptr %dp
-  %newdata = call ptr @j_alloc(i64 %bytes)
+  %newdata = call ptr @j_alloc(i64 %allocbytes)
   call void @j_copy(ptr %newdata, ptr %data, i64 %bytes)
-  store i64 %len, ptr %cp
+  store i64 %newcap, ptr %cp
   store ptr %newdata, ptr %dp
   ret ptr %v
 same:
@@ -1428,7 +1472,7 @@ end:
   ret i64 %n
 }
 
-define internal i64 @json_space(ptr %data, i64 %length, i64 %start) {
+define internal i64 @json_space(ptr %data, i64 %length, i64 %start) alwaysinline {
 entry:
   br label %loop
 loop:
@@ -1438,6 +1482,9 @@ loop:
 body:
   %p = getelementptr i8, ptr %data, i64 %i
   %c = load i8, ptr %p
+  %nonws = icmp ugt i8 %c, 32
+  br i1 %nonws, label %done, label %wscheck
+wscheck:
   %space = icmp eq i8 %c, 32
   %tab = icmp eq i8 %c, 9
   %lf = icmp eq i8 %c, 10
@@ -1747,6 +1794,15 @@ entry:
   %signed = or i1 %negative, %plus
   %signwidth = zext i1 %signed to i64
   %begin = add i64 %start, %signwidth
+  %hasb = icmp ult i64 %begin, %length
+  br i1 %hasb, label %checkfirstdig, label %tryjson_special
+checkfirstdig:
+  %bp = getelementptr i8, ptr %data, i64 %begin
+  %bc = load i8, ptr %bp
+  %bd = sub i8 %bc, 48
+  %bisdig = icmp ult i8 %bd, 10
+  br i1 %bisdig, label %digitstart, label %tryjson_special
+tryjson_special:
   %special = call ptr @json_special(ptr %data, i64 %length, ptr %offset)
   %isspecial = icmp ne ptr %special, null
   br i1 %isspecial, label %specialresult, label %digitstart
@@ -2174,11 +2230,18 @@ streamkeyerror:
   call void @j_json_error(ptr %data, i64 %length, i64 %keyerrorpos, ptr %keymessage, i1 false)
   ret ptr null
 objectkeyparse:
-  %key = call ptr @j_parse(ptr %data, i64 %length, ptr %offset)
-  %kfailed = icmp eq ptr %key, null
+  %keyisquote = icmp eq i8 %keyc, 34
+  br i1 %keyisquote, label %objectkeyfast, label %objectkeygeneral
+objectkeyfast:
+  %fastkey = call ptr @json_string(ptr %data, i64 %length, ptr %offset)
+  %fkfailed = icmp eq ptr %fastkey, null
+  br i1 %fkfailed, label %childfailure, label %colonspace
+objectkeygeneral:
+  %genkey = call ptr @j_parse(ptr %data, i64 %length, ptr %offset)
+  %kfailed = icmp eq ptr %genkey, null
   br i1 %kfailed, label %childfailure, label %keycheck
 keycheck:
-  %kt = load i32, ptr %key
+  %kt = load i32, ptr %genkey
   %stringkey = icmp eq i32 %kt, 4
   br i1 %stringkey, label %colonspace, label %keytypeerror
 keytypeerror:
@@ -2188,6 +2251,7 @@ keytypeerror:
   call void @j_json_error(ptr %data, i64 %length, i64 %badkeyafter, ptr @error_object_keys, i1 false)
   ret ptr null
 colonspace:
+  %key = phi ptr [ %fastkey, %objectkeyfast ], [ %genkey, %keycheck ]
   %kpos = load i64, ptr %offset
   %colonpos = call i64 @json_space(ptr %data, i64 %length, i64 %kpos)
   store i64 %colonpos, ptr %offset
@@ -4554,6 +4618,57 @@ define internal void @dump_literal(ptr %b, ptr %literal) {
 entry:
   %first = load i8, ptr %literal
   %minus = icmp eq i8 %first, 45
+  %iszero0 = icmp eq i8 %first, 48
+  br i1 %iszero0, label %checksinglezero, label %checkfaststart
+checksinglezero:
+  %p1 = getelementptr i8, ptr %literal, i64 1
+  %c1 = load i8, ptr %p1
+  %onlyzero = icmp eq i8 %c1, 0
+  br i1 %onlyzero, label %emitfastzero, label %slowliteral
+emitfastzero:
+  call void @buffer_byte(ptr %b, i8 48)
+  ret void
+checkfaststart:
+  %startidx = zext i1 %minus to i64
+  %pstart = getelementptr i8, ptr %literal, i64 %startidx
+  %d0 = load i8, ptr %pstart
+  %d0sub = sub i8 %d0, 49
+  %d0ok = icmp ult i8 %d0sub, 9
+  br i1 %d0ok, label %fastscaninit, label %slowliteral
+fastscaninit:
+  %firstnext = add i64 %startidx, 1
+  br label %fastscan
+fastscan:
+  %fi = phi i64 [ %firstnext, %fastscaninit ], [ %finext, %fastdigit ], [ %fdotnext, %fastdot ]
+  %fdot = phi i1 [ false, %fastscaninit ], [ %fdot, %fastdigit ], [ true, %fastdot ]
+  %fpi = getelementptr i8, ptr %literal, i64 %fi
+  %fci = load i8, ptr %fpi
+  %fend = icmp eq i8 %fci, 0
+  br i1 %fend, label %fastendcheck, label %fastchar
+fastchar:
+  %fcsub = sub i8 %fci, 48
+  %fcdig = icmp ult i8 %fcsub, 10
+  br i1 %fcdig, label %fastdigit, label %fastcheckdot
+fastdigit:
+  %finext = add i64 %fi, 1
+  br label %fastscan
+fastcheckdot:
+  %fisdot = icmp eq i8 %fci, 46
+  %fnodot = xor i1 %fdot, true
+  %fcandot = and i1 %fisdot, %fnodot
+  br i1 %fcandot, label %fastdot, label %slowliteral
+fastdot:
+  %fdotnext = add i64 %fi, 1
+  br label %fastscan
+fastendcheck:
+  %fprevp = getelementptr i8, ptr %fpi, i64 -1
+  %fprevc = load i8, ptr %fprevp
+  %ftrailingdot = icmp eq i8 %fprevc, 46
+  br i1 %ftrailingdot, label %slowliteral, label %fastappend
+fastappend:
+  call void @buffer_append(ptr %b, ptr %literal, i64 %fi)
+  ret void
+slowliteral:
   %parts = call ptr @decimal_parts(ptr %literal)
   %lp = getelementptr %Decimal, ptr %parts, i32 0, i32 2
   %xp = getelementptr %Decimal, ptr %parts, i32 0, i32 3
@@ -4740,7 +4855,7 @@ entry:
   ret ptr %value
 }
 
-define internal void @json_path_begin(i1 %object) {
+define internal void @json_path_begin(i1 %object) alwaysinline {
 entry:
   %enabled = load i1, ptr @parse_stream_mode
   br i1 %enabled, label %begin, label %done
@@ -4754,7 +4869,7 @@ done:
   ret void
 }
 
-define internal void @json_path_set(ptr %value) {
+define internal void @json_path_set(ptr %value) alwaysinline {
 entry:
   %enabled = load i1, ptr @parse_stream_mode
   br i1 %enabled, label %prepare, label %done
@@ -4775,7 +4890,7 @@ done:
   ret void
 }
 
-define internal void @json_path_index(i64 %index) {
+define internal void @json_path_index(i64 %index) alwaysinline {
 entry:
   %enabled = load i1, ptr @parse_stream_mode
   br i1 %enabled, label %set, label %done
@@ -4788,7 +4903,7 @@ done:
   ret void
 }
 
-define internal void @json_path_pop() {
+define internal void @json_path_pop() alwaysinline {
 entry:
   %enabled = load i1, ptr @parse_stream_mode
   br i1 %enabled, label %prepare, label %done

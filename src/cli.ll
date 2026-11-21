@@ -1536,11 +1536,11 @@ runnext:
   %before_pressure = load i64, ptr @j_gc_pressure
   %in = call ptr @cli_take_next(i1 false)
   %after_pressure = load i64, ptr @j_gc_pressure
-  %fresh_arena = icmp ult i64 %before_pressure, 8388608
-  %double_after = shl i64 %after_pressure, 1
-  %large_input = icmp ugt i64 %double_after, 8388608
+  %fresh_arena = icmp ult i64 %before_pressure, 33554432
+  %triple_after = mul i64 %after_pressure, 3
+  %large_input = icmp ugt i64 %triple_after, 33554432
   %bump_thresh = and i1 %fresh_arena, %large_input
-  %new_thresh = select i1 %bump_thresh, i64 %double_after, i64 8388608
+  %new_thresh = select i1 %bump_thresh, i64 %triple_after, i64 33554432
   store i64 %new_thresh, ptr @j_gc_threshold
   %eof = icmp eq ptr %in, null
   br i1 %eof, label %inputend, label %evaluate

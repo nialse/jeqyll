@@ -72,6 +72,7 @@ declare ptr @j_binary(i32, ptr, ptr)
 declare void @j_fail(ptr)
 declare ptr @j_eval(ptr, ptr, ptr)
 declare ptr @j_eval_take(ptr, ptr, ptr, i64)
+declare ptr @g_try_fast(ptr, ptr, ptr)
 declare ptr @j_text_builtin(ptr, ptr, ptr, ptr)
 declare ptr @j_math_builtin(ptr, ptr, ptr, ptr)
 declare ptr @j_time_builtin(ptr, ptr, ptr, ptr)
@@ -188,13 +189,22 @@ entry:
 
 define i32 @b_find(ptr %name, ptr %table) {
 entry:
+  %nlen = call i64 @b_len(ptr %name)
+  %nempty = icmp eq i64 %nlen, 0
+  br i1 %nempty, label %missing, label %preloop
+preloop:
+  %ndata = call ptr @b_data(ptr %name)
+  %c0 = load i8, ptr %ndata
   br label %loop
 loop:
-  %p = phi ptr [%table, %entry], [%next, %advance]
-  %i = phi i32 [0, %entry], [%inext, %advance]
+  %p = phi ptr [%table, %preloop], [%next, %advance]
+  %i = phi i32 [0, %preloop], [%inext, %advance]
   %c = load i8, ptr %p
   %end = icmp eq i8 %c, 0
-  br i1 %end, label %missing, label %compare
+  br i1 %end, label %missing, label %firstcheck
+firstcheck:
+  %firstsame = icmp eq i8 %c, %c0
+  br i1 %firstsame, label %compare, label %advance
 compare:
   %same = call i1 @j_is(ptr %name, ptr %p)
   br i1 %same, label %found, label %advance
@@ -1463,6 +1473,132 @@ other:
   ret ptr %ur
 }
 
+define ptr @b_fast_zero_arg(ptr %name, ptr %input, ptr %status) {
+entry:
+  %id = call i32 @b_find(ptr %name, ptr @b.names)
+  %tag = call i32 @b_tag(ptr %input)
+  switch i32 %id, label %unhandled [
+    i32 0, label %empty
+    i32 2, label %not
+    i32 3, label %type
+    i32 4, label %length
+    i32 6, label %tostring
+    i32 7, label %tojson
+    i32 8, label %fromjson
+    i32 11, label %farr
+    i32 12, label %fobj
+    i32 13, label %fiter
+    i32 14, label %fbool
+    i32 15, label %fnum
+    i32 16, label %fstr
+    i32 17, label %fnull
+    i32 18, label %fvalue
+    i32 19, label %fscalar
+  ]
+empty:
+  store i32 2, ptr %status
+  ret ptr null
+not:
+  %truth = call i1 @j_truth(ptr %input)
+  %neg = xor i1 %truth, true
+  %nb = call ptr @j_bool(i1 %neg)
+  store i32 1, ptr %status
+  ret ptr %nb
+type:
+  %tn = call ptr @b_typename(ptr %input)
+  %ts = call ptr @j_cstr(ptr %tn)
+  store i32 1, ptr %status
+  ret ptr %ts
+length:
+  switch i32 %tag, label %unhandled [i32 0, label %lenzero i32 4, label %lenstr i32 5, label %lencontainer i32 6, label %lencontainer]
+lenzero:
+  %zv = call ptr @j_num(double 0.000000e+00)
+  store i32 1, ptr %status
+  ret ptr %zv
+lenstr:
+  %strn = call i64 @b_len(ptr %input)
+  %strd = call ptr @b_data(ptr %input)
+  %ulen = call i64 @b_utf8_length(ptr %strd, i64 %strn)
+  %uf = sitofp i64 %ulen to double
+  %uv = call ptr @j_num(double %uf)
+  store i32 1, ptr %status
+  ret ptr %uv
+lencontainer:
+  %clen = call i64 @b_len(ptr %input)
+  %cf = sitofp i64 %clen to double
+  %cv = call ptr @j_num(double %cf)
+  store i32 1, ptr %status
+  ret ptr %cv
+tostring:
+  %stringv = call ptr @b_tostring(ptr %input)
+  store i32 1, ptr %status
+  ret ptr %stringv
+tojson:
+  %jsonv = call ptr @j_dump(ptr %input, i32 0)
+  store i32 1, ptr %status
+  ret ptr %jsonv
+fromjson:
+  %isstr = icmp eq i32 %tag, 4
+  br i1 %isstr, label %fromjsonparse, label %unhandled
+fromjsonparse:
+  %pd = call ptr @b_data(ptr %input)
+  %pn = call i64 @b_len(ptr %input)
+  %offset = alloca i64
+  store i64 0, ptr %offset
+  %parsed = call ptr @j_parse(ptr %pd, i64 %pn, ptr %offset)
+  %consumed = load i64, ptr %offset
+  %pvalid = icmp ne ptr %parsed, null
+  %pcomplete = icmp eq i64 %consumed, %pn
+  %pok = and i1 %pvalid, %pcomplete
+  br i1 %pok, label %fromjsonok, label %fromjsonfallback
+fromjsonok:
+  store i32 1, ptr %status
+  ret ptr %parsed
+fromjsonfallback:
+  store ptr null, ptr @j_error
+  store i32 0, ptr %status
+  ret ptr null
+farr:
+  %isarr = icmp eq i32 %tag, 5
+  br i1 %isarr, label %keep, label %empty
+fobj:
+  %isobj = icmp eq i32 %tag, 6
+  br i1 %isobj, label %keep, label %empty
+fiter:
+  %ia = icmp eq i32 %tag, 5
+  %io = icmp eq i32 %tag, 6
+  %isiter = or i1 %ia, %io
+  br i1 %isiter, label %keep, label %empty
+fbool:
+  %b1 = icmp eq i32 %tag, 1
+  %b2 = icmp eq i32 %tag, 2
+  %isbool = or i1 %b1, %b2
+  br i1 %isbool, label %keep, label %empty
+fnum:
+  %isnum = icmp eq i32 %tag, 3
+  br i1 %isnum, label %keep, label %empty
+fstr:
+  %isstrf = icmp eq i32 %tag, 4
+  br i1 %isstrf, label %keep, label %empty
+fnull:
+  %isnull = icmp eq i32 %tag, 0
+  br i1 %isnull, label %keep, label %empty
+fvalue:
+  %isnonnull = icmp ne i32 %tag, 0
+  br i1 %isnonnull, label %keep, label %empty
+fscalar:
+  %sa = icmp ne i32 %tag, 5
+  %so = icmp ne i32 %tag, 6
+  %isscalar = and i1 %sa, %so
+  br i1 %isscalar, label %keep, label %empty
+keep:
+  store i32 1, ptr %status
+  ret ptr %input
+unhandled:
+  store i32 0, ptr %status
+  ret ptr null
+}
+
 define ptr @b_map(ptr %ast, ptr %input, ptr %env, i1 %preserve, i1 %walking) {
 entry:
   %tag = call i32 @b_tag(ptr %input)
@@ -1484,20 +1620,50 @@ invalid:
   call void @ev_itererror(ptr %input)
   ret ptr %out
 keybegin:
-  %keys = call ptr @b_keys(ptr %input, i1 false)
-  %n = call i64 @b_len(ptr %keys)
+  %n = call i64 @b_len(ptr %input)
   br label %loop
 loop:
   %i = phi i64 [0, %keybegin], [%next, %advance]
   %more = icmp slt i64 %i, %n
   br i1 %more, label %body, label %done
 body:
-  %key = call ptr @j_at(ptr %keys, i64 %i)
-  %value = call ptr @j_get(ptr %input, ptr %key)
-  br i1 %walking, label %walk, label %eval
+  %d = call ptr @b_data(ptr %input)
+  br i1 %obj, label %objload, label %arrload
+objload:
+  %ki = shl i64 %i, 1
+  %vi = add i64 %ki, 1
+  %kp = getelementptr ptr, ptr %d, i64 %ki
+  %vp = getelementptr ptr, ptr %d, i64 %vi
+  %okey = load ptr, ptr %kp
+  %oval = load ptr, ptr %vp
+  br label %loaded
+arrload:
+  %ap = getelementptr ptr, ptr %d, i64 %i
+  %aval = load ptr, ptr %ap
+  br label %loaded
+loaded:
+  %key = phi ptr [%okey, %objload], [null, %arrload]
+  %value = phi ptr [%oval, %objload], [%aval, %arrload]
+  br i1 %walking, label %walk, label %tryfast
 walk:
   %ws = call ptr @b_walk(ptr %ast, ptr %value, ptr %env)
   br label %mapped
+tryfast:
+  %errprior = load ptr, ptr @j_error
+  %hasprior = icmp ne ptr %errprior, null
+  br i1 %hasprior, label %done, label %dofast
+dofast:
+  %fastv = call ptr @g_try_fast(ptr %ast, ptr %value, ptr %env)
+  %fastok = icmp ne ptr %fastv, null
+  br i1 %fastok, label %fastput, label %eval
+fastput:
+  br i1 %objectout, label %putobjfast, label %putarrfast
+putobjfast:
+  call void @j_put(ptr %out, ptr %key, ptr %fastv)
+  br label %advance
+putarrfast:
+  call void @j_push(ptr %out, ptr %fastv)
+  br label %advance
 eval:
   br i1 %preserve, label %evalfirst, label %evalall
 evalfirst:
