@@ -36,6 +36,8 @@
 @cli_write_failed = internal global i1 false
 @cli_reader = internal global ptr null
 @cli_input_status = internal global i32 0
+@cli_out_buf = internal global [65536 x i8] zeroinitializer
+@cli_out_len = internal global i64 0
 
 @c_dot = private constant [2 x i8] c".\00"
 @c_dash = private constant [2 x i8] c"-\00"
@@ -200,11 +202,80 @@ define internal ptr @cli_data(ptr %v) {
   ret ptr %s
 }
 
-define internal void @cli_write(i32 %fd, ptr %p, i64 %n) {
+define internal void @cli_flush() {
 entry:
-  br label %loop
+  %len = load i64, ptr @cli_out_len
+  %empty = icmp eq i64 %len, 0
+  br i1 %empty, label %end, label %loop
 loop:
   %pos = phi i64 [ 0, %entry ], [ %next, %advance ]
+  %done = icmp uge i64 %pos, %len
+  br i1 %done, label %reset, label %body
+body:
+  %at = getelementptr i8, ptr @cli_out_buf, i64 %pos
+  %left = sub i64 %len, %pos
+  br label %writeattempt
+writeattempt:
+  %w = call i64 @write(i32 1, ptr %at, i64 %left)
+  %eintr = load i32, ptr @mtrt_errno_EINTR
+  %eintr64 = sext i32 %eintr to i64
+  %negativeintr = sub i64 0, %eintr64
+  %interrupted = icmp eq i64 %w, %negativeintr
+  br i1 %interrupted, label %writeattempt, label %writecheck
+writecheck:
+  %ok = icmp sgt i64 %w, 0
+  br i1 %ok, label %advance, label %bad
+advance:
+  %next = add i64 %pos, %w
+  br label %loop
+bad:
+  store i32 2, ptr @cli_exit_code
+  store i1 true, ptr @cli_write_failed
+  br label %reset
+reset:
+  store i64 0, ptr @cli_out_len
+  br label %end
+end:
+  ret void
+}
+
+define internal void @cli_write(i32 %fd, ptr %p, i64 %n) {
+entry:
+  %isout = icmp eq i32 %fd, 1
+  br i1 %isout, label %outcheck, label %ordered
+outcheck:
+  %bufbits = load i32, ptr @cli_flags
+  %ubbit = and i32 %bufbits, 65536
+  %unbuffered = icmp ne i32 %ubbit, 0
+  br i1 %unbuffered, label %ordered, label %bufcheck
+ordered:
+  call void @cli_flush()
+  br label %direct
+bufcheck:
+  %curlen = load i64, ptr @cli_out_len
+  %newlen = add i64 %curlen, %n
+  %fits = icmp ule i64 %newlen, 65536
+  br i1 %fits, label %bufput, label %bufbig
+bufput:
+  %dst = getelementptr i8, ptr @cli_out_buf, i64 %curlen
+  call void @llvm.memcpy.p0.p0.i64(ptr %dst, ptr %p, i64 %n, i1 false)
+  store i64 %newlen, ptr @cli_out_len
+  br label %outend
+bufbig:
+  %big = icmp uge i64 %n, 65536
+  br i1 %big, label %ordered2, label %flushfill
+ordered2:
+  call void @cli_flush()
+  br label %direct
+flushfill:
+  call void @cli_flush()
+  call void @llvm.memcpy.p0.p0.i64(ptr @cli_out_buf, ptr %p, i64 %n, i1 false)
+  store i64 %n, ptr @cli_out_len
+  br label %outend
+direct:
+  br label %loop
+loop:
+  %pos = phi i64 [ 0, %direct ], [ %next, %advance ]
   %done = icmp uge i64 %pos, %n
   br i1 %done, label %end, label %body
 body:
@@ -229,6 +300,8 @@ bad:
   %stdout = icmp eq i32 %fd, 1
   store i1 %stdout, ptr @cli_write_failed
   br label %end
+outend:
+  ret void
 end:
   ret void
 }
@@ -975,7 +1048,7 @@ one:
   %Option { ptr @c_disasm, i32 1, i32 32768 },
   %Option { ptr @c_mono, i32 1, i32 8192 },
   %Option { ptr @c_color, i32 1, i32 4096 },
-  %Option { ptr @c_unbuffered, i32 1, i32 0 },
+  %Option { ptr @c_unbuffered, i32 1, i32 65536 },
   %Option { ptr @c_help_opt, i32 2, i32 0 },
   %Option { ptr @c_version_opt, i32 3, i32 0 },
   %Option { ptr @c_from_file, i32 4, i32 0 },
@@ -1307,15 +1380,18 @@ nextarg:
   br label %argloop
 help:
   call void @cli_text(i32 1, ptr @c_help)
+  call void @cli_flush()
   call void @_exit(i32 0)
   unreachable
 version:
   call void @cli_text(i32 1, ptr @c_version)
+  call void @cli_flush()
   call void @_exit(i32 0)
   unreachable
 buildconfiguration:
   call void @cli_text(i32 1, ptr @c_build_info)
   call void @cli_text(i32 1, ptr @c_nl)
+  call void @cli_flush()
   call void @_exit(i32 0)
   unreachable
 unknownoption:
@@ -1326,6 +1402,7 @@ missingarg:
   br label %argerror
 argerror:
   call void @cli_error(i32 2, ptr @c_jq_error)
+  call void @cli_flush()
   call void @_exit(i32 2)
   unreachable
 argsdone:
@@ -1396,6 +1473,7 @@ programbytes:
 programnulerror:
   call void @j_fail(ptr @c_program_nul)
   call void @cli_error(i32 2, ptr @c_compile_prefix)
+  call void @cli_flush()
   call void @_exit(i32 2)
   unreachable
 compile:
@@ -1426,6 +1504,7 @@ debugprogram:
   br label %readinputs
 compileerror:
   call void @cli_compile_errors(ptr %source, i64 %sourcelen, ptr %compileerr)
+  call void @cli_flush()
   call void @_exit(i32 3)
   unreachable
 readinputs:
@@ -1520,6 +1599,7 @@ exitstatus:
   %haderror = icmp ne i32 %rc, 0
   %finalrc = select i1 %haderror, i32 %rc, i32 %normalrc
   %final = select i1 %halt, i32 %hc, i32 %finalrc
+  call void @cli_flush()
   call void @_exit(i32 %final)
   unreachable
 }
