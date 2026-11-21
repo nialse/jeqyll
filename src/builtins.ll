@@ -337,6 +337,7 @@ return:
 
 define void @b_sort_inplace(ptr %values, ptr %keys) {
 entry:
+  %mark = alloca [3 x i64]
   %n = call i64 @b_len(ptr %values)
   %vd = call ptr @b_data(ptr %values)
   %kd = call ptr @b_data(ptr %keys)
@@ -380,7 +381,6 @@ insert:
   %inext = add i64 %i, 1
   br label %outer
 mergestart:
-  %mark = alloca [3 x i64]
   %errbefore = load ptr, ptr @j_error
   call void @j_arena_mark(ptr %mark)
   %bytes = shl i64 %n, 3
@@ -1475,6 +1475,7 @@ other:
 
 define ptr @b_fast_zero_arg(ptr %name, ptr %input, ptr %status) {
 entry:
+  %offset = alloca i64
   %id = call i32 @b_find(ptr %name, ptr @b.names)
   %tag = call i32 @b_tag(ptr %input)
   switch i32 %id, label %unhandled [
@@ -1543,7 +1544,6 @@ fromjson:
 fromjsonparse:
   %pd = call ptr @b_data(ptr %input)
   %pn = call i64 @b_len(ptr %input)
-  %offset = alloca i64
   store i64 0, ptr %offset
   %parsed = call ptr @j_parse(ptr %pd, i64 %pn, ptr %offset)
   %consumed = load i64, ptr %offset
@@ -1718,6 +1718,7 @@ apply:
 
 define ptr @b_sort_family(i32 %id, ptr %args, ptr %input, ptr %env) {
 entry:
+  %mark = alloca [3 x i64]
   %tag = call i32 @b_tag(ptr %input)
   %array = icmp eq i32 %tag, 5
   br i1 %array, label %start, label %bad
@@ -1735,33 +1736,45 @@ start:
   %needflags = or i1 %isgroup, %isuniq
   %flagsize = select i1 %needflags, i64 %n, i64 0
   %flags = call ptr @j_alloc(i64 %flagsize)
-  %mark = alloca [3 x i64]
   %errbefore = load ptr, ptr @j_error
   call void @j_arena_mark(ptr %mark)
   %argc = call i64 @b_len(ptr %args)
   %haskey = icmp sgt i64 %argc, 0
   br i1 %haskey, label %makekeys, label %nokeys
 makekeys:
+  %keyast = call ptr @j_at(ptr %args, i64 0)
   %keysalloc = call ptr @j_array()
   br label %keyloop
 keyloop:
   %i = phi i64 [0, %makekeys], [%next, %keyappend]
+  %looppure = phi i1 [true, %makekeys], [%steppure, %keyappend]
   %more = icmp slt i64 %i, %n
   br i1 %more, label %keybody, label %sort
 keybody:
   %v = call ptr @j_at(ptr %input, i64 %i)
+  %fastkey = call ptr @g_try_fast(ptr %keyast, ptr %v, ptr %env)
+  %fastkeyok = icmp ne ptr %fastkey, null
+  br i1 %fastkeyok, label %keyfastwrap, label %keyslow
+keyfastwrap:
+  %fastarr = call ptr @j_array()
+  call void @j_push(ptr %fastarr, ptr %fastkey)
+  br label %keyappend
+keyslow:
   %s = call ptr @b_arg(ptr %args, i64 0, ptr %v, ptr %env)
   %keyerr = load ptr, ptr @j_error
   %keybad = icmp ne ptr %keyerr, %errbefore
   br i1 %keybad, label %abort, label %keyappend
 keyappend:
-  call void @j_push(ptr %keysalloc, ptr %s)
+  %keyval = phi ptr [%fastarr, %keyfastwrap], [%s, %keyslow]
+  %steppure = phi i1 [%looppure, %keyfastwrap], [false, %keyslow]
+  call void @j_push(ptr %keysalloc, ptr %keyval)
   %next = add i64 %i, 1
   br label %keyloop
 nokeys:
   br label %sort
 sort:
   %keys = phi ptr [%keysalloc, %keyloop], [%values, %nokeys]
+  %allpure = phi i1 [%looppure, %keyloop], [true, %nokeys]
   call void @b_sort_inplace(ptr %values, ptr %keys)
   br i1 %needflags, label %flagstart, label %rewindcheck
 flagstart:
@@ -1793,9 +1806,13 @@ flagstore:
 rewindcheck:
   %errafter = load ptr, ptr @j_error
   %clean = icmp eq ptr %errafter, %errbefore
-  br i1 %clean, label %dorewind, label %abort
+  br i1 %clean, label %rewindpurecheck, label %abort
+rewindpurecheck:
+  br i1 %allpure, label %dorewind, label %dispatch
 dorewind:
   call void @j_arena_rewind(ptr %mark)
+  br label %dispatch
+dispatch:
   switch i32 %id, label %sorted [i32 29, label %dedup i32 30, label %dedup i32 31, label %dedup i32 32, label %min i32 33, label %max i32 34, label %min i32 35, label %max]
 abort:
   %emptyabort = call ptr @j_array()

@@ -31,6 +31,9 @@
 @gc_count = internal global i64 0
 @gc_min_addr = internal global i64 -1
 @gc_max_addr = internal global i64 0
+@gc_ranges = internal global [128 x [2 x i64]] zeroinitializer
+@gc_range_count = internal global i64 0
+@gc_range_overflow = internal global i1 false
 @j_gc_pressure = global i64 0
 @j_gc_threshold = global i64 8388608
 @value_null = internal global %V zeroinitializer
@@ -311,6 +314,8 @@ entry:
 begin:
   call void @j_arena_mark(ptr @gc_old_state)
   call void @j_copy(ptr @gc_base_mark, ptr %mark, i64 24)
+  store i64 0, ptr @gc_range_count
+  store i1 false, ptr @gc_range_overflow
   %head = load ptr, ptr @gc_old_state
   %base = load ptr, ptr @gc_base_mark
   %cursorp = getelementptr %ArenaMark, ptr @gc_base_mark, i32 0, i32 1
@@ -329,21 +334,56 @@ boundbody:
   %usedp = getelementptr %ArenaBlock, ptr %b, i32 0, i32 2
   %bused = load ptr, ptr %usedp
   %nonempty = icmp ult ptr %bstart, %bused
+  br i1 %nonempty, label %recordrange, label %boundstep
+recordrange:
   %startint = ptrtoint ptr %bstart to i64
   %usedint = ptrtoint ptr %bused to i64
   %lessmin = icmp ult i64 %startint, %min
   %candmin = select i1 %lessmin, i64 %startint, i64 %min
   %moremax = icmp ugt i64 %usedint, %max
   %candmax = select i1 %moremax, i64 %usedint, i64 %max
-  %nextmin = select i1 %nonempty, i64 %candmin, i64 %min
-  %nextmax = select i1 %nonempty, i64 %candmax, i64 %max
+  %rcount = load i64, ptr @gc_range_count
+  %hasroom = icmp ult i64 %rcount, 128
+  br i1 %hasroom, label %insertloop, label %markoverflow
+insertloop:
+  %ins = phi i64 [ %rcount, %recordrange ], [ %insprev, %insertshift ]
+  %atfront = icmp eq i64 %ins, 0
+  br i1 %atfront, label %insertput, label %insertcmp
+insertcmp:
+  %insprev = sub i64 %ins, 1
+  %prevsp = getelementptr [128 x [2 x i64]], ptr @gc_ranges, i64 0, i64 %insprev, i64 0
+  %prevs = load i64, ptr %prevsp
+  %prevgreater = icmp ugt i64 %prevs, %startint
+  br i1 %prevgreater, label %insertshift, label %insertput
+insertshift:
+  %prevep = getelementptr [128 x [2 x i64]], ptr @gc_ranges, i64 0, i64 %insprev, i64 1
+  %preve = load i64, ptr %prevep
+  %dstsp = getelementptr [128 x [2 x i64]], ptr @gc_ranges, i64 0, i64 %ins, i64 0
+  %dstep = getelementptr [128 x [2 x i64]], ptr @gc_ranges, i64 0, i64 %ins, i64 1
+  store i64 %prevs, ptr %dstsp
+  store i64 %preve, ptr %dstep
+  br label %insertloop
+insertput:
+  %putsp = getelementptr [128 x [2 x i64]], ptr @gc_ranges, i64 0, i64 %ins, i64 0
+  %putep = getelementptr [128 x [2 x i64]], ptr @gc_ranges, i64 0, i64 %ins, i64 1
+  store i64 %startint, ptr %putsp
+  store i64 %usedint, ptr %putep
+  %newrcount = add i64 %rcount, 1
+  store i64 %newrcount, ptr @gc_range_count
+  br label %boundstep
+markoverflow:
+  store i1 true, ptr @gc_range_overflow
+  br label %boundstep
+boundstep:
+  %nextmin = phi i64 [ %min, %boundbody ], [ %candmin, %insertput ], [ %candmin, %markoverflow ]
+  %nextmax = phi i64 [ %max, %boundbody ], [ %candmax, %insertput ], [ %candmax, %markoverflow ]
   br i1 %atmark, label %bounddone, label %boundnext
 boundnext:
   %bprev = load ptr, ptr %b
   br label %boundloop
 bounddone:
-  %finalmin = phi i64 [ %min, %boundloop ], [ %nextmin, %boundbody ]
-  %finalmax = phi i64 [ %max, %boundloop ], [ %nextmax, %boundbody ]
+  %finalmin = phi i64 [ %min, %boundloop ], [ %nextmin, %boundstep ]
+  %finalmax = phi i64 [ %max, %boundloop ], [ %nextmax, %boundstep ]
   store i64 %finalmin, ptr @gc_min_addr
   store i64 %finalmax, ptr @gc_max_addr
   store i64 0, ptr @j_gc_pressure
@@ -368,47 +408,61 @@ entry:
   %gemin = icmp uge i64 %addr, %min
   %ltmax = icmp ult i64 %addr, %max
   %inbox = and i1 %gemin, %ltmax
-  br i1 %inbox, label %premark, label %no
-premark:
+  br i1 %inbox, label %checkoverflow, label %no
+checkoverflow:
+  %overflow = load i1, ptr @gc_range_overflow
+  br i1 %overflow, label %slowwalk, label %fastcheck
+fastcheck:
+  %rcount = load i64, ptr @gc_range_count
+  %single = icmp eq i64 %rcount, 1
+  br i1 %single, label %yes, label %bsearch
+bsearch:
+  %lo = phi i64 [ 0, %fastcheck ], [ %lo_next, %bsearch_right ], [ %lo, %bsearch_left ]
+  %hi = phi i64 [ %rcount, %fastcheck ], [ %hi, %bsearch_right ], [ %mid, %bsearch_left ]
+  %hasrange = icmp ult i64 %lo, %hi
+  br i1 %hasrange, label %bsearch_body, label %no
+bsearch_body:
+  %sum = add i64 %lo, %hi
+  %mid = lshr i64 %sum, 1
+  %sp = getelementptr [128 x [2 x i64]], ptr @gc_ranges, i64 0, i64 %mid, i64 0
+  %rstart = load i64, ptr %sp
+  %before = icmp ult i64 %addr, %rstart
+  br i1 %before, label %bsearch_left, label %bsearch_endcheck
+bsearch_left:
+  br label %bsearch
+bsearch_endcheck:
+  %ep = getelementptr [128 x [2 x i64]], ptr @gc_ranges, i64 0, i64 %mid, i64 1
+  %rend = load i64, ptr %ep
+  %inside = icmp ult i64 %addr, %rend
+  br i1 %inside, label %yes, label %bsearch_right
+bsearch_right:
+  %lo_next = add i64 %mid, 1
+  br label %bsearch
+slowwalk:
+  %head = load ptr, ptr @gc_old_state
   %mark = load ptr, ptr @gc_base_mark
   %cursorp = getelementptr %ArenaMark, ptr @gc_base_mark, i32 0, i32 1
   %markedcursor = load ptr, ptr %cursorp
-  br label %preloop
-preloop:
-  %pb = phi ptr [ %mark, %premark ], [ %pprev, %prenext ]
-  %pend = icmp eq ptr %pb, null
-  br i1 %pend, label %perm, label %prebody
-prebody:
-  %ismark = icmp eq ptr %pb, %mark
-  %ppayload = getelementptr i8, ptr %pb, i64 32
-  %pusedp = getelementptr %ArenaBlock, ptr %pb, i32 0, i32 2
-  %pused = load ptr, ptr %pusedp
-  %plimit = select i1 %ismark, ptr %markedcursor, ptr %pused
-  %pafter = icmp uge ptr %value, %ppayload
-  %pbefore = icmp ult ptr %value, %plimit
-  %pinside = and i1 %pafter, %pbefore
-  br i1 %pinside, label %no, label %prenext
-prenext:
-  %pprev = load ptr, ptr %pb
-  br label %preloop
-perm:
-  %permhead = load ptr, ptr @permanent_block
-  br label %permloop
-permloop:
-  %mb = phi ptr [ %permhead, %perm ], [ %mprev, %permnext ]
-  %mend = icmp eq ptr %mb, null
-  br i1 %mend, label %yes, label %permbody
-permbody:
-  %mpayload = getelementptr i8, ptr %mb, i64 32
-  %musedp = getelementptr %ArenaBlock, ptr %mb, i32 0, i32 2
-  %mused = load ptr, ptr %musedp
-  %mafter = icmp uge ptr %value, %mpayload
-  %mbefore = icmp ult ptr %value, %mused
-  %minside = and i1 %mafter, %mbefore
-  br i1 %minside, label %no, label %permnext
-permnext:
-  %mprev = load ptr, ptr %mb
-  br label %permloop
+  br label %loop
+loop:
+  %block = phi ptr [ %head, %slowwalk ], [ %previous, %advance ]
+  %end = icmp eq ptr %block, null
+  br i1 %end, label %no, label %range
+range:
+  %atmark = icmp eq ptr %block, %mark
+  %payload = getelementptr i8, ptr %block, i64 32
+  %begin = select i1 %atmark, ptr %markedcursor, ptr %payload
+  %usedp = getelementptr %ArenaBlock, ptr %block, i32 0, i32 2
+  %used = load ptr, ptr %usedp
+  %afterbegin = icmp uge ptr %value, %begin
+  %beforeend = icmp ult ptr %value, %used
+  %inblock = and i1 %afterbegin, %beforeend
+  br i1 %inblock, label %yes, label %nextcheck
+nextcheck:
+  br i1 %atmark, label %no, label %advance
+advance:
+  %previous = load ptr, ptr %block
+  br label %loop
 yes:
   ret i1 true
 no:
@@ -2405,8 +2459,12 @@ slow:
   ret void
 }
 
+; Finalizes %b into an immutable JSON string by transferring ownership of its
+; NUL-terminated backing storage and resetting %b so subsequent writes cannot
+; alias the returned value.
 define internal ptr @buffer_value(ptr %b) {
   %lp = getelementptr %Buffer, ptr %b, i32 0, i32 1
+  %cp = getelementptr %Buffer, ptr %b, i32 0, i32 2
   %len = load i64, ptr %lp
   %data = load ptr, ptr %b
   %v = call ptr @j_alloc(i64 48)
@@ -2423,6 +2481,9 @@ fresh:
   ret ptr %v
 wrap:
   store ptr %data, ptr %dpv
+  store ptr null, ptr %b
+  store i64 0, ptr %lp
+  store i64 0, ptr %cp
   ret ptr %v
 }
 

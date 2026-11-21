@@ -68,7 +68,7 @@ declare ptr @cli_take_input()
 declare void @j_collect(ptr)
 declare ptr @j_expand_builtin(ptr, ptr, ptr, ptr)
 declare ptr @b_fast_zero_arg(ptr, ptr, ptr)
-declare ptr @ev_try_fast_assign(ptr, ptr, i32, ptr, ptr)
+declare ptr @ev_try_fast_assign(ptr, ptr, i32, ptr, ptr, i32)
 
 define internal ptr @g_work(ptr %iterator, i32 %kind, i32 %op, ptr %node, ptr %input, ptr %env, ptr %continuation, ptr %handler, ptr %a, ptr %b, i64 %index) {
   %work = call ptr @j_alloc(i64 80)
@@ -331,8 +331,9 @@ entry:
   ret ptr %r
 }
 
-define internal ptr @g_try_fast_depth(ptr %node, ptr %input, ptr %env, i32 %depth) {
+define ptr @g_try_fast_depth(ptr %node, ptr %input, ptr %env, i32 %depth) {
 entry:
+  %cstatus = alloca i32
   %nullnode = icmp eq ptr %node, null
   %toodeep = icmp sgt i32 %depth, 128
   %bail = or i1 %nullnode, %toodeep
@@ -375,17 +376,17 @@ varok:
   %vv = load ptr, ptr %vp
   ret ptr %vv
 pipe:
-  %pmid = call ptr @g_try_fast_depth(ptr %a, ptr %input, ptr %env, i32 %depth)
+  %pmid = call ptr @g_try_fast_depth(ptr %a, ptr %input, ptr %env, i32 %nextd)
   %pok = icmp ne ptr %pmid, null
   br i1 %pok, label %piperhs, label %fail
 piperhs:
-  %pres = call ptr @g_try_fast_depth(ptr %b, ptr %pmid, ptr %env, i32 %depth)
+  %pres = call ptr @g_try_fast_depth(ptr %b, ptr %pmid, ptr %env, i32 %nextd)
   ret ptr %pres
 bin:
   %islogic = icmp uge i32 %op, 11
   br i1 %islogic, label %binlogic, label %binarith
 binlogic:
-  %llv = call ptr @g_try_fast_depth(ptr %a, ptr %input, ptr %env, i32 %depth)
+  %llv = call ptr @g_try_fast_depth(ptr %a, ptr %input, ptr %env, i32 %nextd)
   %llok = icmp ne ptr %llv, null
   br i1 %llok, label %binlogiccheck, label %fail
 binlogiccheck:
@@ -397,7 +398,7 @@ binlogicshort:
   %lsres = call ptr @j_bool(i1 %ltr)
   ret ptr %lsres
 binlogicrhs:
-  %lrv = call ptr @g_try_fast_depth(ptr %b, ptr %input, ptr %env, i32 %depth)
+  %lrv = call ptr @g_try_fast_depth(ptr %b, ptr %input, ptr %env, i32 %nextd)
   %lrok = icmp ne ptr %lrv, null
   br i1 %lrok, label %binlogicdone, label %fail
 binlogicdone:
@@ -405,11 +406,11 @@ binlogicdone:
   %lrres = call ptr @j_bool(i1 %rtr)
   ret ptr %lrres
 binarith:
-  %arv = call ptr @g_try_fast_depth(ptr %b, ptr %input, ptr %env, i32 %depth)
+  %arv = call ptr @g_try_fast_depth(ptr %b, ptr %input, ptr %env, i32 %nextd)
   %arok = icmp ne ptr %arv, null
   br i1 %arok, label %binarithlhs, label %fail
 binarithlhs:
-  %alv = call ptr @g_try_fast_depth(ptr %a, ptr %input, ptr %env, i32 %depth)
+  %alv = call ptr @g_try_fast_depth(ptr %a, ptr %input, ptr %env, i32 %nextd)
   %alok = icmp ne ptr %alv, null
   br i1 %alok, label %binarithapply, label %fail
 binarithapply:
@@ -420,11 +421,11 @@ binarithapply:
 binarithok:
   ret ptr %bres
 fld:
-  %flv = call ptr @g_try_fast_depth(ptr %a, ptr %input, ptr %env, i32 %depth)
+  %flv = call ptr @g_try_fast_depth(ptr %a, ptr %input, ptr %env, i32 %nextd)
   %flok = icmp ne ptr %flv, null
   br i1 %flok, label %fldkey, label %fail
 fldkey:
-  %fkv = call ptr @g_try_fast_depth(ptr %b, ptr %input, ptr %env, i32 %depth)
+  %fkv = call ptr @g_try_fast_depth(ptr %b, ptr %input, ptr %env, i32 %nextd)
   %fkok = icmp ne ptr %fkv, null
   br i1 %fkok, label %fldget, label %fail
 fldget:
@@ -435,16 +436,16 @@ fldget:
 fldok:
   ret ptr %fres
 cond:
-  %ccv = call ptr @g_try_fast_depth(ptr %a, ptr %input, ptr %env, i32 %depth)
+  %ccv = call ptr @g_try_fast_depth(ptr %a, ptr %input, ptr %env, i32 %nextd)
   %ccok = icmp ne ptr %ccv, null
   br i1 %ccok, label %condbranch, label %fail
 condbranch:
   %ctr = call i1 @j_truth(ptr %ccv)
   %cbr = select i1 %ctr, ptr %b, ptr %c
-  %cres = call ptr @g_try_fast_depth(ptr %cbr, ptr %input, ptr %env, i32 %depth)
+  %cres = call ptr @g_try_fast_depth(ptr %cbr, ptr %input, ptr %env, i32 %nextd)
   ret ptr %cres
 neg:
-  %nv = call ptr @g_try_fast_depth(ptr %a, ptr %input, ptr %env, i32 %depth)
+  %nv = call ptr @g_try_fast_depth(ptr %a, ptr %input, ptr %env, i32 %nextd)
   %nok = icmp ne ptr %nv, null
   br i1 %nok, label %negapply, label %fail
 negapply:
@@ -459,14 +460,14 @@ bind:
   %bisvar = icmp eq i32 %bpatkind, 10
   br i1 %bisvar, label %bindeval, label %fail
 bindeval:
-  %bval = call ptr @g_try_fast_depth(ptr %a, ptr %input, ptr %env, i32 %depth)
+  %bval = call ptr @g_try_fast_depth(ptr %a, ptr %input, ptr %env, i32 %nextd)
   %bok = icmp ne ptr %bval, null
   br i1 %bok, label %bindbody, label %fail
 bindbody:
   %bvnp = getelementptr %GN, ptr %b, i32 0, i32 2
   %bvn = load ptr, ptr %bvnp
   %benv = call ptr @j_bind(ptr %env, ptr %bvn, ptr %bval)
-  %bres2 = call ptr @g_try_fast_depth(ptr %c, ptr %input, ptr %benv, i32 %depth)
+  %bres2 = call ptr @g_try_fast_depth(ptr %c, ptr %input, ptr %benv, i32 %nextd)
   ret ptr %bres2
 call:
   %carity = call i64 @b_len(ptr %b)
@@ -498,7 +499,6 @@ callfl:
   %cflres = call ptr @g_try_fast_depth(ptr %cflbody, ptr %input, ptr %cflenv, i32 %nextd)
   ret ptr %cflres
 callbuiltin:
-  %cstatus = alloca i32
   store i32 0, ptr %cstatus
   %cbres = call ptr @b_fast_zero_arg(ptr %a, ptr %input, ptr %cstatus)
   %cst = load i32, ptr %cstatus
@@ -539,7 +539,7 @@ objput:
 objdone:
   ret ptr %oobj
 assign:
-  %ares = call ptr @ev_try_fast_assign(ptr %a, ptr %b, i32 %op, ptr %input, ptr %env)
+  %ares = call ptr @ev_try_fast_assign(ptr %a, ptr %b, i32 %op, ptr %input, ptr %env, i32 %nextd)
   ret ptr %ares
 clearfail:
   store ptr null, ptr @j_error
@@ -569,6 +569,7 @@ entry:
   %currentvalue = alloca ptr
   %currentcont = alloca ptr
   %currenthandler = alloca ptr
+  %fzstatus = alloca i32
   store ptr null, ptr %currenthandler
   %priorerror = load ptr, ptr @j_error
   %priorbreak = load ptr, ptr @ev_break_name
@@ -1147,7 +1148,7 @@ slice:
   call void @g_schedule(ptr %iterator, ptr %a, ptr %input, ptr %env, ptr %slicek, ptr %handler)
   br label %loop
 assignment:
-  %assignfast = call ptr @ev_try_fast_assign(ptr %a, ptr %b, i32 %op, ptr %input, ptr %env)
+  %assignfast = call ptr @ev_try_fast_assign(ptr %a, ptr %b, i32 %op, ptr %input, ptr %env, i32 0)
   %assignfastok = icmp ne ptr %assignfast, null
   br i1 %assignfastok, label %assignfastemit, label %assigncheck
 assignfastemit:
@@ -1199,7 +1200,6 @@ nativecall:
   %iszeroarg = icmp eq i64 %arity, 0
   br i1 %iszeroarg, label %nativefastzero, label %nativeexpand
 nativefastzero:
-  %fzstatus = alloca i32
   store i32 0, ptr %fzstatus
   %fzval = call ptr @b_fast_zero_arg(ptr %a, ptr %input, ptr %fzstatus)
   %fzst = load i32, ptr %fzstatus

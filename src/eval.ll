@@ -86,6 +86,7 @@ declare ptr @j_clone(ptr)
 declare i32 @j_cmp(ptr, ptr)
 declare i1 @j_str_eq(ptr, ptr)
 declare ptr @g_try_fast(ptr, ptr, ptr)
+declare ptr @g_try_fast_depth(ptr, ptr, ptr, i32)
 declare i1 @j_truth(ptr)
 declare ptr @j_parse(ptr, i64, ptr)
 declare ptr @j_lex_number(ptr, i64, ptr)
@@ -3659,15 +3660,18 @@ done:
   ret i64 %floor
 }
 
-define ptr @ev_try_fast_assign(ptr %lhs, ptr %rhs, i32 %op, ptr %input, ptr %env) {
+define ptr @ev_try_fast_assign(ptr %lhs, ptr %rhs, i32 %op, ptr %input, ptr %env, i32 %depth) {
 entry:
+  %toodeep = icmp sgt i32 %depth, 128
   %nullin = icmp eq ptr %input, null
   %nulllhs = icmp eq ptr %lhs, null
   %nullrhs = icmp eq ptr %rhs, null
   %null0 = or i1 %nullin, %nulllhs
-  %nullany = or i1 %null0, %nullrhs
+  %null1 = or i1 %null0, %nullrhs
+  %nullany = or i1 %null1, %toodeep
   br i1 %nullany, label %fail, label %checkop
 checkop:
+  %nextd = add i32 %depth, 1
   %itag = load i32, ptr %input
   %iobj = icmp eq i32 %itag, 6
   %isupd = icmp eq i32 %op, 265
@@ -3699,7 +3703,7 @@ checkbase:
 level1:
   %old1 = call ptr @j_get(ptr %input, ptr %k1)
   %rin1 = select i1 %isupd, ptr %old1, ptr %input
-  %new1 = call ptr @g_try_fast(ptr %rhs, ptr %rin1, ptr %env)
+  %new1 = call ptr @g_try_fast_depth(ptr %rhs, ptr %rin1, ptr %env, i32 %nextd)
   %ok1 = icmp ne ptr %new1, null
   br i1 %ok1, label %apply1, label %fail
 apply1:
@@ -3731,7 +3735,7 @@ getmid:
 eval2:
   %old2 = call ptr @j_get(ptr %mid, ptr %k1)
   %rin2 = select i1 %isupd, ptr %old2, ptr %input
-  %new2 = call ptr @g_try_fast(ptr %rhs, ptr %rin2, ptr %env)
+  %new2 = call ptr @g_try_fast_depth(ptr %rhs, ptr %rin2, ptr %env, i32 %nextd)
   %ok2 = icmp ne ptr %new2, null
   br i1 %ok2, label %apply2, label %fail
 apply2:
@@ -3746,7 +3750,7 @@ fail:
 
 define internal ptr @ev_assignment(ptr %lhs, ptr %rhs, i32 %op, ptr %input, ptr %env) {
 entry:
-  %fast = call ptr @ev_try_fast_assign(ptr %lhs, ptr %rhs, i32 %op, ptr %input, ptr %env)
+  %fast = call ptr @ev_try_fast_assign(ptr %lhs, ptr %rhs, i32 %op, ptr %input, ptr %env, i32 0)
   %hasfast = icmp ne ptr %fast, null
   br i1 %hasfast, label %fastdone, label %slowentry
 fastdone:
