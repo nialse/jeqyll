@@ -157,6 +157,8 @@
 @t.strindices = private constant [12 x i8] c"_strindices\00"
 @t.errstartswith = private constant [36 x i8] c"startswith() requires string inputs\00"
 @t.errendswith = private constant [34 x i8] c"endswith() requires string inputs\00"
+@t.errexplode = private constant [31 x i8] c"explode input must be a string\00"
+@t.errsplit = private constant [42 x i8] c"split input and separator must be strings\00"
 @j_error = external global ptr
 
 declare i32 @b_tag(ptr)
@@ -346,6 +348,17 @@ formatbad:
 define ptr @j_split(ptr %input, ptr %sep) {
 entry:
   %offset = alloca i64
+  %itag = call i32 @b_tag(ptr %input)
+  %stag = call i32 @b_tag(ptr %sep)
+  %istr = icmp eq i32 %itag, 4
+  %sstr = icmp eq i32 %stag, 4
+  %bothstr = and i1 %istr, %sstr
+  br i1 %bothstr, label %valid, label %bad
+bad:
+  call void @j_fail(ptr @t.errsplit)
+  %nil = call ptr @j_null()
+  ret ptr %nil
+valid:
   %out = call ptr @j_array()
   %s = call ptr @b_data(ptr %input)
   %n = call i64 @b_len(ptr %input)
@@ -403,7 +416,7 @@ charbody:
   call void @j_push(ptr %out, ptr %cv)
   br label %charloop
 loop:
-  %start = phi i64 [0, %entry], [%next, %found]
+  %start = phi i64 [0, %valid], [%next, %found]
   %idx = call i64 @b_search_bytes(ptr %s, i64 %n, ptr %d, i64 %dn, i64 %start)
   %have = icmp sge i64 %idx, 0
   br i1 %have, label %found, label %tail
@@ -636,6 +649,14 @@ done:
 
 define ptr @t_ascii(ptr %input, i1 %upper) {
 entry:
+  %tag = call i32 @b_tag(ptr %input)
+  %str = icmp eq i32 %tag, 4
+  br i1 %str, label %valid, label %bad
+bad:
+  call void @j_fail(ptr @t.errexplode)
+  %nil = call ptr @j_null()
+  ret ptr %nil
+valid:
   %s = call ptr @b_data(ptr %input)
   %n = call i64 @b_len(ptr %input)
   %lo = select i1 %upper, i8 97, i8 65
@@ -643,7 +664,7 @@ entry:
   %delta = select i1 %upper, i8 -32, i8 32
   br label %prescan
 prescan:
-  %pi = phi i64 [0, %entry], [%pnext, %pno]
+  %pi = phi i64 [0, %valid], [%pnext, %pno]
   %pmore = icmp ult i64 %pi, %n
   br i1 %pmore, label %pbody, label %sameout
 pbody:
