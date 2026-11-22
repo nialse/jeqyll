@@ -506,6 +506,10 @@ call:
 callonecheck:
   br i1 %cone, label %callone, label %fail
 callone:
+  %c1tid = call i32 @b_find(ptr %a, ptr @g_text_fast_names)
+  %c1istext = icmp sge i32 %c1tid, 2
+  br i1 %c1istext, label %callonepriv, label %fail
+callonepriv:
   %c1priv = icmp sle i32 %op, -2
   br i1 %c1priv, label %callonearg, label %calloneshadow
 calloneshadow:
@@ -521,7 +525,6 @@ callonearg:
   %c1argok = icmp ne ptr %c1argv, null
   br i1 %c1argok, label %callonedispatch, label %fail
 callonedispatch:
-  %c1tid = call i32 @b_find(ptr %a, ptr @g_text_fast_names)
   switch i32 %c1tid, label %clearfail [
     i32 2, label %c1split
     i32 3, label %c1join
