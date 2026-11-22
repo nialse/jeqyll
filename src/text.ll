@@ -1,3 +1,136 @@
+%V = type { i32, i32, double, i64, i64, ptr, ptr }
+@t.charbytes = private constant [256 x i8] c"\00\00\01\00\02\00\03\00\04\00\05\00\06\00\07\00\08\00\09\00\0A\00\0B\00\0C\00\0D\00\0E\00\0F\00\10\00\11\00\12\00\13\00\14\00\15\00\16\00\17\00\18\00\19\00\1A\00\1B\00\1C\00\1D\00\1E\00\1F\00\20\00\21\00\22\00\23\00\24\00\25\00\26\00\27\00\28\00\29\00\2A\00\2B\00\2C\00\2D\00\2E\00\2F\00\30\00\31\00\32\00\33\00\34\00\35\00\36\00\37\00\38\00\39\00\3A\00\3B\00\3C\00\3D\00\3E\00\3F\00\40\00\41\00\42\00\43\00\44\00\45\00\46\00\47\00\48\00\49\00\4A\00\4B\00\4C\00\4D\00\4E\00\4F\00\50\00\51\00\52\00\53\00\54\00\55\00\56\00\57\00\58\00\59\00\5A\00\5B\00\5C\00\5D\00\5E\00\5F\00\60\00\61\00\62\00\63\00\64\00\65\00\66\00\67\00\68\00\69\00\6A\00\6B\00\6C\00\6D\00\6E\00\6F\00\70\00\71\00\72\00\73\00\74\00\75\00\76\00\77\00\78\00\79\00\7A\00\7B\00\7C\00\7D\00\7E\00\7F\00"
+
+@t.charvals = internal constant [128 x %V] [
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 0), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 2), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 4), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 6), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 8), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 10), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 12), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 14), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 16), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 18), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 20), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 22), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 24), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 26), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 28), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 30), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 32), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 34), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 36), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 38), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 40), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 42), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 44), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 46), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 48), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 50), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 52), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 54), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 56), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 58), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 60), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 62), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 64), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 66), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 68), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 70), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 72), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 74), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 76), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 78), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 80), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 82), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 84), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 86), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 88), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 90), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 92), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 94), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 96), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 98), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 100), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 102), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 104), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 106), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 108), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 110), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 112), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 114), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 116), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 118), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 120), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 122), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 124), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 126), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 128), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 130), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 132), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 134), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 136), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 138), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 140), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 142), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 144), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 146), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 148), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 150), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 152), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 154), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 156), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 158), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 160), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 162), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 164), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 166), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 168), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 170), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 172), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 174), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 176), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 178), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 180), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 182), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 184), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 186), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 188), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 190), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 192), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 194), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 196), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 198), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 200), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 202), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 204), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 206), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 208), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 210), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 212), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 214), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 216), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 218), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 220), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 222), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 224), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 226), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 228), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 230), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 232), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 234), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 236), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 238), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 240), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 242), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 244), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 246), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 248), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 250), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 252), ptr null }, 
+  %V { i32 4, i32 0, double 0.0, i64 1, i64 0, ptr getelementptr inbounds (i8, ptr @t.charbytes, i64 254), ptr null }
+]
 @t.names = private constant [186 x i8] c"split\00join\00explode\00implode\00ascii_downcase\00ascii_upcase\00startswith\00endswith\00ltrimstr\00rtrimstr\00trimstr\00trim\00ltrim\00rtrim\00@text\00@json\00@html\00@uri\00@urid\00@csv\00@tsv\00@sh\00@base64\00@base64d\00format\00\00"
 @t.base64 = private constant [65 x i8] c"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/\00"
 @t.hex = private constant [17 x i8] c"0123456789ABCDEF\00"
@@ -212,15 +345,49 @@ formatbad:
 
 define ptr @j_split(ptr %input, ptr %sep) {
 entry:
+  %offset = alloca i64
   %out = call ptr @j_array()
   %s = call ptr @b_data(ptr %input)
   %n = call i64 @b_len(ptr %input)
   %d = call ptr @b_data(ptr %sep)
   %dn = call i64 @b_len(ptr %sep)
   %empty = icmp eq i64 %dn, 0
-  br i1 %empty, label %chars, label %loop
+  br i1 %empty, label %asciicheck, label %loop
+asciicheck:
+  br label %ascanscan
+ascanscan:
+  %ai = phi i64 [0, %asciicheck], [%anext, %ascanbody]
+  %amore = icmp ult i64 %ai, %n
+  br i1 %amore, label %ascanbody, label %prealloc
+ascanbody:
+  %ap = getelementptr i8, ptr %s, i64 %ai
+  %ab = load i8, ptr %ap
+  %aok = icmp ult i8 %ab, 128
+  %anext = add i64 %ai, 1
+  br i1 %aok, label %ascanscan, label %chars
+prealloc:
+  %wide = shl i64 %n, 3
+  %slots = call ptr @j_alloc(i64 %wide)
+  %alen = getelementptr %V, ptr %out, i32 0, i32 3
+  %acap = getelementptr %V, ptr %out, i32 0, i32 4
+  %adata = getelementptr %V, ptr %out, i32 0, i32 5
+  store i64 0, ptr %alen
+  store i64 %n, ptr %acap
+  store ptr %slots, ptr %adata
+  br label %pushloop
+pushloop:
+  %pi = phi i64 [0, %prealloc], [%pnext, %pushbody]
+  %pmore = icmp ult i64 %pi, %n
+  br i1 %pmore, label %pushbody, label %done
+pushbody:
+  %pp = getelementptr i8, ptr %s, i64 %pi
+  %pb = load i8, ptr %pp
+  %pbz = zext i8 %pb to i64
+  %cvv = getelementptr [128 x %V], ptr @t.charvals, i64 0, i64 %pbz
+  call void @j_push(ptr %out, ptr %cvv)
+  %pnext = add i64 %pi, 1
+  br label %pushloop
 chars:
-  %offset = alloca i64
   store i64 0, ptr %offset
   br label %charloop
 charloop:
@@ -248,6 +415,9 @@ found:
   %next = add i64 %idx, %dn
   br label %loop
 tail:
+  %hasinput = icmp ne i64 %n, 0
+  br i1 %hasinput, label %tailpush, label %done
+tailpush:
   %tlen = sub i64 %n, %start
   %tptr = getelementptr i8, ptr %s, i64 %start
   %tv = call ptr @j_str(ptr %tptr, i64 %tlen)
@@ -258,6 +428,90 @@ done:
 }
 
 define ptr @t_join(ptr %input, ptr %sep) {
+entry:
+  %n = call i64 @b_len(ptr %input)
+  %septag = call i32 @b_tag(ptr %sep)
+  %empty = icmp eq i64 %n, 0
+  %sepok = icmp eq i32 %septag, 4
+  %notempty = xor i1 %empty, true
+  %go = and i1 %sepok, %notempty
+  br i1 %go, label %scanloop, label %slowcall
+slowcall:
+  %slow = call ptr @t_join_general(ptr %input, ptr %sep)
+  ret ptr %slow
+scanloop:
+  %si = phi i64 [0, %entry], [%snext, %scanend]
+  %total = phi i64 [0, %entry], [%stotal, %scanend]
+  %more = icmp slt i64 %si, %n
+  br i1 %more, label %scanbody, label %scandone
+scanbody:
+  %v = call ptr @j_at(ptr %input, i64 %si)
+  %t = call i32 @b_tag(ptr %v)
+  %isnull = icmp eq i32 %t, 0
+  %isstr = icmp eq i32 %t, 4
+  %ok = or i1 %isnull, %isstr
+  br i1 %ok, label %scanadd, label %slowcall
+scanadd:
+  %len = call i64 @b_len(ptr %v)
+  %stotal = add i64 %total, %len
+  %snext = add i64 %si, 1
+  br label %scanend
+scanend:
+  br label %scanloop
+scandone:
+  %seplen = call i64 @b_len(ptr %sep)
+  %gaps = sub i64 %n, 1
+  %sepbytes = mul i64 %gaps, %seplen
+  %totalall = add i64 %total, %sepbytes
+  %cap = add i64 %totalall, 1
+  %data = call ptr @j_alloc(i64 %cap)
+  %out = call ptr @j_alloc(i64 48)
+  store i32 4, ptr %out
+  %outlen = getelementptr %V, ptr %out, i32 0, i32 3
+  %outdata = getelementptr %V, ptr %out, i32 0, i32 5
+  store i64 %totalall, ptr %outlen
+  store ptr %data, ptr %outdata
+  %sepdata = call ptr @b_data(ptr %sep)
+  br label %buildloop
+buildloop:
+  %bi = phi i64 [0, %scandone], [%bnext, %buildtail]
+  %pos = phi i64 [0, %scandone], [%bpos2, %buildtail]
+  %bmore = icmp slt i64 %bi, %n
+  br i1 %bmore, label %buildbody, label %builddone
+buildbody:
+  %first = icmp eq i64 %bi, 0
+  br i1 %first, label %builditem, label %buildsep
+buildsep:
+  %dst0 = getelementptr i8, ptr %data, i64 %pos
+  call void @j_copy(ptr %dst0, ptr %sepdata, i64 %seplen)
+  %ipos = add i64 %pos, %seplen
+  br label %builditem
+builditem:
+  %bpos = phi i64 [%ipos, %buildsep], [%pos, %buildbody]
+  %bv = call ptr @j_at(ptr %input, i64 %bi)
+  %bt = call i32 @b_tag(ptr %bv)
+  %bstr = icmp eq i32 %bt, 4
+  br i1 %bstr, label %buildcopy, label %buildskip
+buildcopy:
+  %bdata = call ptr @b_data(ptr %bv)
+  %blen = call i64 @b_len(ptr %bv)
+  %bdst = getelementptr i8, ptr %data, i64 %bpos
+  call void @j_copy(ptr %bdst, ptr %bdata, i64 %blen)
+  %npos = add i64 %bpos, %blen
+  br label %buildskip
+buildskip:
+  %bpos2 = phi i64 [%bpos, %builditem], [%npos, %buildcopy]
+  %bnext = add i64 %bi, 1
+  br label %buildtail
+buildtail:
+  br label %buildloop
+builddone:
+  %endp = getelementptr i8, ptr %data, i64 %totalall
+  store i8 0, ptr %endp
+  ret ptr %out
+}
+
+define internal ptr @t_join_general(ptr %input, ptr %sep) {
 entry:
   %n = call i64 @b_len(ptr %input)
   %empty = call ptr @j_cstr(ptr @t.empty)
@@ -384,31 +638,56 @@ define ptr @t_ascii(ptr %input, i1 %upper) {
 entry:
   %s = call ptr @b_data(ptr %input)
   %n = call i64 @b_len(ptr %input)
-  %size = add i64 %n, 1
-  %buf = call ptr @j_alloc(i64 %size)
   %lo = select i1 %upper, i8 97, i8 65
   %hi = select i1 %upper, i8 122, i8 90
   %delta = select i1 %upper, i8 -32, i8 32
+  br label %prescan
+prescan:
+  %pi = phi i64 [0, %entry], [%pnext, %pno]
+  %pmore = icmp ult i64 %pi, %n
+  br i1 %pmore, label %pbody, label %sameout
+pbody:
+  %pp = getelementptr i8, ptr %s, i64 %pi
+  %pc = load i8, ptr %pp
+  %pge = icmp uge i8 %pc, %lo
+  %ple = icmp ule i8 %pc, %hi
+  %pch = and i1 %pge, %ple
+  %pnext = add i64 %pi, 1
+  br i1 %pch, label %alloc, label %pno
+pno:
+  br label %prescan
+sameout:
+  ret ptr %input
+alloc:
+  %cap = add i64 %n, 1
+  %data = call ptr @j_alloc(i64 %cap)
+  %out = call ptr @j_alloc(i64 48)
+  store i32 4, ptr %out
+  %olen = getelementptr %V, ptr %out, i32 0, i32 3
+  %odata = getelementptr %V, ptr %out, i32 0, i32 5
+  store i64 %n, ptr %olen
+  store ptr %data, ptr %odata
   br label %loop
 loop:
-  %i = phi i64 [0, %entry], [%next, %body]
+  %i = phi i64 [0, %alloc], [%next, %body]
   %more = icmp slt i64 %i, %n
   br i1 %more, label %body, label %done
 body:
   %src = getelementptr i8, ptr %s, i64 %i
-  %dst = getelementptr i8, ptr %buf, i64 %i
+  %dst = getelementptr i8, ptr %data, i64 %i
   %c = load i8, ptr %src
   %ge = icmp uge i8 %c, %lo
   %le = icmp ule i8 %c, %hi
-  %change = and i1 %ge, %le
+  %ch = and i1 %ge, %le
   %changed = add i8 %c, %delta
-  %out = select i1 %change, i8 %changed, i8 %c
-  store i8 %out, ptr %dst
+  %outb = select i1 %ch, i8 %changed, i8 %c
+  store i8 %outb, ptr %dst
   %next = add i64 %i, 1
   br label %loop
 done:
-  %r = call ptr @j_str(ptr %buf, i64 %n)
-  ret ptr %r
+  %endp = getelementptr i8, ptr %data, i64 %n
+  store i8 0, ptr %endp
+  ret ptr %out
 }
 
 define ptr @t_edge(i32 %id, ptr %input, ptr %arg) {
@@ -448,12 +727,22 @@ endbool:
   ret ptr %eb
 left:
   %lstart = select i1 %startmatch, i64 %an, i64 0
+  %lsame = icmp eq i64 %lstart, 0
+  br i1 %lsame, label %leftsame, label %lefttrim
+leftsame:
+  ret ptr %input
+lefttrim:
   %llen = sub i64 %n, %lstart
   %lp = getelementptr i8, ptr %s, i64 %lstart
   %lv = call ptr @j_str(ptr %lp, i64 %llen)
   ret ptr %lv
 right:
   %rlen = select i1 %endmatch, i64 %endpos, i64 %n
+  %rsame = icmp eq i64 %rlen, %n
+  br i1 %rsame, label %rightsame, label %righttrim
+rightsame:
+  ret ptr %input
+righttrim:
   %rv = call ptr @j_str(ptr %s, i64 %rlen)
   ret ptr %rv
 both:
@@ -463,6 +752,11 @@ both:
   %trimend = and i1 %still, %endmatch
   %bend = select i1 %trimend, i64 %endpos, i64 %n
   %blen = sub i64 %bend, %bstart
+  %bsame = icmp eq i64 %blen, %n
+  br i1 %bsame, label %bothsame, label %bothtrim
+bothsame:
+  ret ptr %input
+bothtrim:
   %bp = getelementptr i8, ptr %s, i64 %bstart
   %bv = call ptr @j_str(ptr %bp, i64 %blen)
   ret ptr %bv
