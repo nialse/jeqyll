@@ -84,6 +84,9 @@ declare void @j_put(ptr, ptr, ptr)
 declare ptr @j_get(ptr, ptr)
 declare ptr @j_clone(ptr)
 declare i32 @j_cmp(ptr, ptr)
+declare i1 @j_str_eq(ptr, ptr)
+declare ptr @g_try_fast(ptr, ptr, ptr)
+declare ptr @g_try_fast_depth(ptr, ptr, ptr, i32)
 declare i1 @j_truth(ptr)
 declare ptr @j_parse(ptr, i64, ptr)
 declare ptr @j_lex_number(ptr, i64, ptr)
@@ -99,6 +102,9 @@ declare ptr @j_pick(ptr, ptr, ptr)
 declare ptr @b_delete_many(ptr, ptr)
 declare ptr @j_builtin_take(ptr, ptr, ptr, ptr, i64)
 declare i1 @b_known(ptr, i64)
+declare i64 @b_len(ptr)
+declare ptr @b_data(ptr)
+declare ptr @b_core(i32, ptr, ptr, ptr)
 declare ptr @j_eval(ptr, ptr, ptr)
 declare ptr @j_eval_take(ptr, ptr, ptr, i64)
 
@@ -1671,9 +1677,20 @@ validate:
   store ptr null, ptr @ev_validation_bindings
   %validationerror = load ptr, ptr @j_error
   %valid = icmp eq ptr %validationerror, null
-  br i1 %valid, label %returngood, label %returnerror
+  br i1 %valid, label %unwrapcheck, label %returnerror
+unwrapcheck:
+  %mkind = load i32, ptr %mainast
+  %misimport = icmp eq i32 %mkind, 24
+  %mopp = getelementptr %N, ptr %mainast, i32 0, i32 1
+  %mop = load i32, ptr %mopp
+  %mdead = icmp eq i32 %mop, -1
+  %munwrap = and i1 %misimport, %mdead
+  %mcp = getelementptr %N, ptr %mainast, i32 0, i32 4
+  %mchild = load ptr, ptr %mcp
+  %finalmain = select i1 %munwrap, ptr %mchild, ptr %mainast
+  br label %returngood
 returngood:
-  %result = phi ptr [%ast, %good], [%mainast, %validate]
+  %result = phi ptr [%ast, %good], [%finalmain, %unwrapcheck]
   store i64 %depth, ptr @ev_compile_depth
   ret ptr %result
 bad:
@@ -1709,15 +1726,23 @@ loop:
   %done = icmp eq ptr %e, null
   br i1 %done, label %missing, label %check
 check:
-  %np = getelementptr %E, ptr %e, i32 0, i32 1
-  %n = load ptr, ptr %np
-  %cmp = call i32 @j_cmp(ptr %name, ptr %n)
-  %same = icmp eq i32 %cmp, 0
   %tp = getelementptr %E, ptr %e, i32 0, i32 3
   %t = load i32, ptr %tp
   %samekind = icmp eq i32 %t, %type
-  %both = and i1 %same, %samekind
-  br i1 %both, label %aritycheck, label %advance
+  br i1 %samekind, label %kindok, label %advance
+kindok:
+  %np = getelementptr %E, ptr %e, i32 0, i32 1
+  %n = load ptr, ptr %np
+  %ntag = load i32, ptr %n
+  %nstr = icmp eq i32 %ntag, 4
+  br i1 %nstr, label %streq, label %genname
+streq:
+  %same = call i1 @j_str_eq(ptr %name, ptr %n)
+  br i1 %same, label %aritycheck, label %advance
+genname:
+  %cmp = call i32 @j_cmp(ptr %name, ptr %n)
+  %samecmp = icmp eq i32 %cmp, 0
+  br i1 %samecmp, label %aritycheck, label %advance
 aritycheck:
   %function = icmp eq i32 %t, 1
   br i1 %function, label %countparams, label %found
@@ -1733,6 +1758,70 @@ advance:
 found:
   ret ptr %e
 missing:
+  ret ptr null
+}
+
+; Single-pass variant of the userlookup/filterlookup pair in j_eval_atom: one
+; traversal of the env chain records the nearest kind-1 function matching the
+; arity and the nearest kind-2 filter. Preferring kind-1 (even one found later
+; in the chain) reproduces exactly the "functions first, then filters" order of
+; the original two traversals.
+define ptr @ev_lookup1or2(ptr %env, ptr %name, i64 %arity, ptr %kindout) {
+entry:
+  br label %loop
+loop:
+  %e = phi ptr [ %env, %entry ], [ %next, %advance ]
+  %fbest = phi ptr [ null, %entry ], [ %fb2next, %advance ]
+  %over = icmp eq ptr %e, null
+  br i1 %over, label %missing, label %check
+check:
+  %tp = getelementptr %E, ptr %e, i32 0, i32 3
+  %t = load i32, ptr %tp
+  %isfunc = icmp eq i32 %t, 1
+  %isfilter = icmp eq i32 %t, 2
+  %relevant = or i1 %isfunc, %isfilter
+  br i1 %relevant, label %nameentry, label %advance
+nameentry:
+  %np = getelementptr %E, ptr %e, i32 0, i32 1
+  %n = load ptr, ptr %np
+  %ntag = load i32, ptr %n
+  %nstr = icmp eq i32 %ntag, 4
+  br i1 %nstr, label %streq, label %genname
+streq:
+  %same = call i1 @j_str_eq(ptr %name, ptr %n)
+  br i1 %same, label %kindsel, label %advance
+genname:
+  %cmp = call i32 @j_cmp(ptr %name, ptr %n)
+  %samecmp = icmp eq i32 %cmp, 0
+  br i1 %samecmp, label %kindsel, label %advance
+kindsel:
+  %isfunc.sel = icmp eq i32 %t, 1
+  br i1 %isfunc.sel, label %funcheck, label %filterkeep
+funcheck:
+  %pp = getelementptr %E, ptr %e, i32 0, i32 4
+  %params = load ptr, ptr %pp
+  %count = call i64 @ev_len(ptr %params)
+  %samearity = icmp eq i64 %count, %arity
+  br i1 %samearity, label %foundfunc, label %advance
+foundfunc:
+  store i32 1, ptr %kindout
+  ret ptr %e
+filterkeep:
+  %takef = icmp eq ptr %fbest, null
+  %fbcand = select i1 %takef, ptr %e, ptr %fbest
+  br label %advance
+advance:
+  %fb2next = phi ptr [ %fbest, %check ], [ %fbest, %streq ], [ %fbest, %genname ], [ %fbest, %funcheck ], [ %fbcand, %filterkeep ]
+  %next = load ptr, ptr %e
+  br label %loop
+missing:
+  %hasfilter = icmp ne ptr %fbest, null
+  br i1 %hasfilter, label %filterfound, label %nothingfound
+filterfound:
+  store i32 2, ptr %kindout
+  ret ptr %fbest
+nothingfound:
+  store i32 0, ptr %kindout
   ret ptr null
 }
 
@@ -2234,9 +2323,115 @@ done:
 @ev_invalid_path_value = internal global ptr null
 @ev_invalid_path_detailed = internal global i1 false
 
+; --- fast core-builtin dispatch ---
+; @ev_b_blob is a byte-exact copy of builtins.ll @b.names, @ev_b_ids a
+; precomputed FNV-1a open-addressing table (linear probing), @ev_b_offs the
+; per-id blob offsets. Probe hits are verified against the blob string; any
+; miss or collision falls back to the original j_builtin path, so results
+; cannot differ from the table scan. The same helper resolves the generator
+; table in iterate.ll (declared there via @ev_name_id).
+
+@ev_b_blob = private constant [572 x i8] c"empty\00error\00not\00type\00length\00utf8bytelength\00tostring\00tojson\00fromjson\00tonumber\00toboolean\00arrays\00objects\00iterables\00booleans\00numbers\00strings\00nulls\00values\00scalars\00keys\00keys_unsorted\00has\00in\00contains\00inside\00reverse\00sort\00sort_by\00group_by\00unique\00unique_by\00min\00max\00min_by\00max_by\00add\00flatten\00map\00map_values\00select\00range\00any\00all\00first\00last\00nth\00limit\00skip\00isempty\00to_entries\00from_entries\00with_entries\00transpose\00combinations\00getpath\00setpath\00delpaths\00paths\00leaf_paths\00recurse\00recurse_down\00walk\00while\00until\00bsearch\00indices\00index\00rindex\00INDEX\00IN\00builtins\00have_decnum\00have_literal_numbers\00\00"
+@ev_b_offs = private constant [74 x i32] [
+  i32 0, i32 6, i32 12, i32 16, i32 21, i32 28, i32 43, i32 52, i32 59, i32 68, i32 77, i32 87, i32 94, i32 102, i32 112, i32 121,
+  i32 129, i32 137, i32 143, i32 150, i32 158, i32 163, i32 177, i32 181, i32 184, i32 193, i32 200, i32 208, i32 213, i32 221, i32 230, i32 237,
+  i32 247, i32 251, i32 255, i32 262, i32 269, i32 273, i32 281, i32 285, i32 296, i32 303, i32 309, i32 313, i32 317, i32 323, i32 328, i32 332,
+  i32 338, i32 343, i32 351, i32 362, i32 375, i32 388, i32 398, i32 411, i32 419, i32 427, i32 436, i32 442, i32 453, i32 461, i32 474, i32 479,
+  i32 485, i32 491, i32 499, i32 507, i32 513, i32 520, i32 526, i32 529, i32 538, i32 550
+]
+@ev_b_ids = private constant [512 x i32] [
+  i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 26, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1,
+  i32 62, i32 -1, i32 -1, i32 -1, i32 -1, i32 4, i32 7, i32 -1, i32 -1, i32 45, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1,
+  i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 15, i32 -1, i32 -1, i32 -1, i32 40, i32 -1, i32 -1,
+  i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 18, i32 -1, i32 -1, i32 49, i32 57,
+  i32 -1, i32 44, i32 60, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 54, i32 -1, i32 -1, i32 -1, i32 42, i32 -1, i32 -1,
+  i32 -1, i32 -1, i32 73, i32 28, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1,
+  i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 12, i32 -1, i32 -1, i32 -1, i32 -1,
+  i32 -1, i32 -1, i32 66, i32 -1, i32 36, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 68, i32 -1, i32 -1, i32 -1, i32 -1,
+  i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 71, i32 2, i32 -1, i32 72, i32 -1, i32 -1, i32 -1,
+  i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 9, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 23, i32 -1,
+  i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 50, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1,
+  i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1,
+  i32 55, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 65, i32 -1, i32 -1, i32 -1, i32 20, i32 63, i32 11,
+  i32 -1, i32 27, i32 41, i32 -1, i32 -1, i32 34, i32 46, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1,
+  i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 6, i32 -1, i32 -1, i32 -1, i32 -1, i32 19, i32 -1, i32 -1, i32 -1, i32 0, i32 -1,
+  i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1,
+  i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 69, i32 -1, i32 -1, i32 -1, i32 -1,
+  i32 -1, i32 16, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 33, i32 -1, i32 -1, i32 -1, i32 -1, i32 70, i32 -1,
+  i32 -1, i32 -1, i32 -1, i32 -1, i32 14, i32 -1, i32 30, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1,
+  i32 -1, i32 -1, i32 -1, i32 -1, i32 47, i32 -1, i32 -1, i32 -1, i32 24, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1,
+  i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 3, i32 51, i32 64,
+  i32 -1, i32 1, i32 -1, i32 8, i32 -1, i32 -1, i32 -1, i32 32, i32 -1, i32 -1, i32 52, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1,
+  i32 39, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 25, i32 -1, i32 -1,
+  i32 13, i32 -1, i32 -1, i32 61, i32 -1, i32 17, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1,
+  i32 10, i32 -1, i32 -1, i32 -1, i32 5, i32 -1, i32 31, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1,
+  i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 58,
+  i32 -1, i32 -1, i32 -1, i32 -1, i32 56, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 35, i32 67, i32 -1, i32 -1, i32 -1,
+  i32 -1, i32 38, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 29, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1,
+  i32 53, i32 -1, i32 48, i32 -1, i32 43, i32 -1, i32 -1, i32 -1, i32 -1, i32 37, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1,
+  i32 -1, i32 -1, i32 59, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 21, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1,
+  i32 -1, i32 -1, i32 -1, i32 22, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1,
+  i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1
+]
+
+
+
+; Resolve %v (a string value) to its slot id in a precomputed probe table.
+; Slots hold the id of the name placed there, -1 when empty. A hit is verified
+; against the blob string; probing on hash collisions and any miss returns -1,
+; so the caller's fallback path keeps behavior identical to b_find.
+define i32 @ev_name_id(ptr %v, ptr %blob, ptr %offs, ptr %ids, i32 %slots) {
+entry:
+  %ndata = call ptr @b_data(ptr %v)
+  %nlen = call i64 @b_len(ptr %v)
+  br label %hashloop
+hashloop:
+  %hp = phi i64 [ 0, %entry ], [ %hn, %hashbody ]
+  %hh = phi i32 [ 2166136261, %entry ], [ %hm, %hashbody ]
+  %hdone = icmp uge i64 %hp, %nlen
+  br i1 %hdone, label %probefirst, label %hashbody
+hashbody:
+  %hcp = getelementptr i8, ptr %ndata, i64 %hp
+  %hc = load i8, ptr %hcp
+  %hc32 = zext i8 %hc to i32
+  %hx = xor i32 %hh, %hc32
+  %hm = mul i32 %hx, 16777619
+  %hn = add i64 %hp, 1
+  br label %hashloop
+probefirst:
+  %m32 = sub i32 %slots, 1
+  %h0 = and i32 %hh, %m32
+  %h0w = zext i32 %h0 to i64
+  %mw = zext i32 %m32 to i64
+  br label %probe
+probe:
+  %hp2 = phi i64 [ %h0w, %probefirst ], [ %hmasked, %probeagain ]
+  %idp = getelementptr i32, ptr %ids, i64 %hp2
+  %id = load i32, ptr %idp
+  %known = icmp sge i32 %id, 0
+  br i1 %known, label %verify, label %miss
+verify:
+  %idw = sext i32 %id to i64
+  %offp = getelementptr i32, ptr %offs, i64 %idw
+  %off = load i32, ptr %offp
+  %offw = sext i32 %off to i64
+  %np = getelementptr i8, ptr %blob, i64 %offw
+  %same = call i1 @j_is(ptr %v, ptr %np)
+  br i1 %same, label %found, label %probeagain
+probeagain:
+  %hnext2 = add i64 %hp2, 1
+  %hmasked = and i64 %hnext2, %mw
+  br label %probe
+found:
+  ret i32 %id
+miss:
+  ret i32 -1
+}
+
 define ptr @j_eval_atom(ptr %node, ptr %input, ptr %env) {
 entry:
   %out = call ptr @j_array()
+  %callkindslot = alloca i32, align 4
   %noast = icmp eq ptr %node, null
   %error = load ptr, ptr @j_error
   %haserror = icmp ne ptr %error, null
@@ -2404,26 +2599,26 @@ call:
   %privatebuiltin = icmp sle i32 %op, -2
   br i1 %privatebuiltin, label %specialcheck, label %userlookup
 userlookup:
-  %function = call ptr @ev_lookup(ptr %env, ptr %a, i32 1, i64 %arity)
-  %foundfunction = icmp ne ptr %function, null
-  br i1 %foundfunction, label %usercall, label %filterlookup
+  %either = call ptr @ev_lookup1or2(ptr %env, ptr %a, i64 %arity, ptr %callkindslot)
+  %eitherkind = load i32, ptr %callkindslot
+  %eitherfunc = icmp eq i32 %eitherkind, 1
+  br i1 %eitherfunc, label %usercall, label %eitherflcheck
+eitherflcheck:
+  %eitherfilter = icmp eq i32 %eitherkind, 2
+  br i1 %eitherfilter, label %filtercall, label %specialcheck
 usercall:
-  %bodyp = getelementptr %E, ptr %function, i32 0, i32 2
+  %bodyp = getelementptr %E, ptr %either, i32 0, i32 2
   %body = load ptr, ptr %bodyp
-  %paramsp = getelementptr %E, ptr %function, i32 0, i32 4
+  %paramsp = getelementptr %E, ptr %either, i32 0, i32 4
   %params = load ptr, ptr %paramsp
-  %defenvp = getelementptr %E, ptr %function, i32 0, i32 5
+  %defenvp = getelementptr %E, ptr %either, i32 0, i32 5
   %defenv = load ptr, ptr %defenvp
   %userresult = call ptr @ev_callargs(ptr %body, ptr %params, ptr %b, i64 0, ptr %input, ptr %env, ptr %defenv)
   ret ptr %userresult
-filterlookup:
-  %filter = call ptr @ev_lookup(ptr %env, ptr %a, i32 2, i64 0)
-  %foundfilter = icmp ne ptr %filter, null
-  br i1 %foundfilter, label %filtercall, label %specialcheck
 filtercall:
-  %filterp = getelementptr %E, ptr %filter, i32 0, i32 2
+  %filterp = getelementptr %E, ptr %either, i32 0, i32 2
   %filterast = load ptr, ptr %filterp
-  %filterenvp = getelementptr %E, ptr %filter, i32 0, i32 5
+  %filterenvp = getelementptr %E, ptr %either, i32 0, i32 5
   %filterenv = load ptr, ptr %filterenvp
   %filterresult = call ptr @j_eval(ptr %filterast, ptr %input, ptr %filterenv)
   ret ptr %filterresult
@@ -2460,11 +2655,21 @@ delcall:
   call void @ev_pushvalid(ptr %out, ptr %deleted)
   br label %done
 builtincall:
+  %builtinid = call i32 @ev_name_id(ptr %a, ptr @ev_b_blob, ptr @ev_b_offs, ptr @ev_b_ids, i32 512)
+  %fastknown = icmp sge i32 %builtinid, 0
+  br i1 %fastknown, label %fastcore, label %slowbuiltin
+fastcore:
+  %bresult = call ptr @b_core(i32 %builtinid, ptr %b, ptr %input, ptr %env)
+  br label %builtinknown
+slowbuiltin:
   %builtinresult = call ptr @j_builtin(ptr %a, ptr %b, ptr %input, ptr %env)
-  %known = icmp ne ptr %builtinresult, null
+  br label %builtinknown
+builtinknown:
+  %builtinresult2 = phi ptr [ %bresult, %fastcore ], [ %builtinresult, %slowbuiltin ]
+  %known = icmp ne ptr %builtinresult2, null
   br i1 %known, label %builtindone, label %unknown
 builtindone:
-  ret ptr %builtinresult
+  ret ptr %builtinresult2
 unknown:
   call void @j_fail(ptr @ev_undefined)
   br label %done
@@ -2728,9 +2933,19 @@ label:
   %hasbreakname = icmp ne ptr %breakname, null
   br i1 %hasbreakname, label %labelcompare, label %labeldone
 labelcompare:
-  %labelcmp = call i32 @j_cmp(ptr %a, ptr %breakname)
-  %labelmatch = icmp eq i32 %labelcmp, 0
+  %lcatag = load i32, ptr %a
+  %lbntag = load i32, ptr %breakname
+  %lcastreq = icmp eq i32 %lcatag, 4
+  %lbntstreq = icmp eq i32 %lbntag, 4
+  %lcbothstr = and i1 %lcastreq, %lbntstreq
+  br i1 %lcbothstr, label %labelstreq, label %labelgen
+labelstreq:
+  %labelmatch = call i1 @j_str_eq(ptr %a, ptr %breakname)
   br i1 %labelmatch, label %labelclear, label %labeldone
+labelgen:
+  %labelcmp = call i32 @j_cmp(ptr %a, ptr %breakname)
+  %labelmatch2 = icmp eq i32 %labelcmp, 0
+  br i1 %labelmatch2, label %labelclear, label %labeldone
 labelclear:
   store ptr null, ptr @ev_break_name
   br label %labeldone
@@ -3464,8 +3679,18 @@ objbody:
   %ovidx = add i64 %oki, 1
   %ovp = getelementptr ptr, ptr %odata, i64 %ovidx
   %ov = load ptr, ptr %ovp
-  %same = call i32 @j_cmp(ptr %ok, ptr %key)
-  %remove = icmp eq i32 %same, 0
+  %odoktag = load i32, ptr %ok
+  %odkeytag = load i32, ptr %key
+  %odokeq = icmp eq i32 %odoktag, 4
+  %odkeyeq = icmp eq i32 %odkeytag, 4
+  %odbothstr = and i1 %odokeq, %odkeyeq
+  br i1 %odbothstr, label %odstreq, label %odgen
+odstreq:
+  %same = call i1 @j_str_eq(ptr %ok, ptr %key)
+  br i1 %same, label %objnext, label %objkeep
+odgen:
+  %samecmp = call i32 @j_cmp(ptr %ok, ptr %key)
+  %remove = icmp eq i32 %samecmp, 0
   br i1 %remove, label %objnext, label %objkeep
 objkeep:
   call void @j_put(ptr %odst, ptr %ok, ptr %ov)
@@ -3618,8 +3843,104 @@ done:
   ret i64 %floor
 }
 
+define ptr @ev_try_fast_assign(ptr %lhs, ptr %rhs, i32 %op, ptr %input, ptr %env, i32 %depth) {
+entry:
+  %toodeep = icmp sgt i32 %depth, 128
+  %nullin = icmp eq ptr %input, null
+  %nulllhs = icmp eq ptr %lhs, null
+  %nullrhs = icmp eq ptr %rhs, null
+  %null0 = or i1 %nullin, %nulllhs
+  %null1 = or i1 %null0, %nullrhs
+  %nullany = or i1 %null1, %toodeep
+  br i1 %nullany, label %fail, label %checkop
+checkop:
+  %nextd = add i32 %depth, 1
+  %itag = load i32, ptr %input
+  %iobj = icmp eq i32 %itag, 6
+  %isupd = icmp eq i32 %op, 265
+  %isset = icmp eq i32 %op, 61
+  %opok = or i1 %isupd, %isset
+  %ok0 = and i1 %iobj, %opok
+  br i1 %ok0, label %checklhs, label %fail
+checklhs:
+  %lkind = load i32, ptr %lhs
+  %lisfld = icmp eq i32 %lkind, 5
+  br i1 %lisfld, label %checkkey1, label %fail
+checkkey1:
+  %lap = getelementptr %N, ptr %lhs, i32 0, i32 2
+  %la = load ptr, ptr %lap
+  %lbp = getelementptr %N, ptr %lhs, i32 0, i32 3
+  %lb = load ptr, ptr %lbp
+  %lbkind = load i32, ptr %lb
+  %lblit = icmp eq i32 %lbkind, 0
+  br i1 %lblit, label %loadkey1, label %fail
+loadkey1:
+  %k1p = getelementptr %N, ptr %lb, i32 0, i32 2
+  %k1 = load ptr, ptr %k1p
+  %k1tag = load i32, ptr %k1
+  %k1str = icmp eq i32 %k1tag, 4
+  br i1 %k1str, label %checkbase, label %fail
+checkbase:
+  %lakind = load i32, ptr %la
+  switch i32 %lakind, label %fail [ i32 1, label %level1 i32 5, label %level2 ]
+level1:
+  %old1 = call ptr @j_get(ptr %input, ptr %k1)
+  %rin1 = select i1 %isupd, ptr %old1, ptr %input
+  %new1 = call ptr @g_try_fast_depth(ptr %rhs, ptr %rin1, ptr %env, i32 %nextd)
+  %ok1 = icmp ne ptr %new1, null
+  br i1 %ok1, label %apply1, label %fail
+apply1:
+  %cp1 = call ptr @j_clone(ptr %input)
+  call void @j_put(ptr %cp1, ptr %k1, ptr %new1)
+  ret ptr %cp1
+level2:
+  %laap = getelementptr %N, ptr %la, i32 0, i32 2
+  %laa = load ptr, ptr %laap
+  %labp = getelementptr %N, ptr %la, i32 0, i32 3
+  %lab = load ptr, ptr %labp
+  %laakind = load i32, ptr %laa
+  %laaid = icmp eq i32 %laakind, 1
+  %labkind = load i32, ptr %lab
+  %lablit = icmp eq i32 %labkind, 0
+  %l2ok = and i1 %laaid, %lablit
+  br i1 %l2ok, label %loadkey0, label %fail
+loadkey0:
+  %k0p = getelementptr %N, ptr %lab, i32 0, i32 2
+  %k0 = load ptr, ptr %k0p
+  %k0tag = load i32, ptr %k0
+  %k0str = icmp eq i32 %k0tag, 4
+  br i1 %k0str, label %getmid, label %fail
+getmid:
+  %mid = call ptr @j_get(ptr %input, ptr %k0)
+  %midtag = load i32, ptr %mid
+  %midobj = icmp eq i32 %midtag, 6
+  br i1 %midobj, label %eval2, label %fail
+eval2:
+  %old2 = call ptr @j_get(ptr %mid, ptr %k1)
+  %rin2 = select i1 %isupd, ptr %old2, ptr %input
+  %new2 = call ptr @g_try_fast_depth(ptr %rhs, ptr %rin2, ptr %env, i32 %nextd)
+  %ok2 = icmp ne ptr %new2, null
+  br i1 %ok2, label %apply2, label %fail
+apply2:
+  %midcp = call ptr @j_clone(ptr %mid)
+  call void @j_put(ptr %midcp, ptr %k1, ptr %new2)
+  %cp2 = call ptr @j_clone(ptr %input)
+  call void @j_put(ptr %cp2, ptr %k0, ptr %midcp)
+  ret ptr %cp2
+fail:
+  ret ptr null
+}
+
 define internal ptr @ev_assignment(ptr %lhs, ptr %rhs, i32 %op, ptr %input, ptr %env) {
 entry:
+  %fast = call ptr @ev_try_fast_assign(ptr %lhs, ptr %rhs, i32 %op, ptr %input, ptr %env, i32 0)
+  %hasfast = icmp ne ptr %fast, null
+  br i1 %hasfast, label %fastdone, label %slowentry
+fastdone:
+  %fastout = call ptr @j_array()
+  call void @j_push(ptr %fastout, ptr %fast)
+  ret ptr %fastout
+slowentry:
   store ptr null, ptr @ev_invalid_path_value
   store i1 false, ptr @ev_invalid_path_detailed
   %out = call ptr @j_array()
@@ -4406,6 +4727,11 @@ define ptr @ev_importenv(ptr %node, ptr %env, ptr %directory) {
 entry:
   %op.p = getelementptr %N, ptr %node, i32 0, i32 1
   %op = load i32, ptr %op.p
+  %skipped = icmp eq i32 %op, -1
+  br i1 %skipped, label %fastskip, label %startimport
+fastskip:
+  ret ptr %env
+startimport:
   %data = icmp eq i32 %op, 1
   %ap = getelementptr %N, ptr %node, i32 0, i32 2
   %path = load ptr, ptr %ap
@@ -4423,6 +4749,7 @@ entry:
 failed:
   br i1 %optional, label %ignore, label %report
 ignore:
+  store i32 -1, ptr %op.p
   store ptr null, ptr @j_error
   ret ptr %env
 report:

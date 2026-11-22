@@ -22,8 +22,8 @@ for source in src/*.ll; do
     set -- "$@" "$output/$name.bc"
 done
 llvm-link "$@" "$output/libmuffintop.bc" "$output/host.bc" "$output/host_common.bc" "$output/start.bc" -o "$output/linked.bc"
-opt -passes='default<O1>,verify' "$output/linked.bc" -o "$output/jeqy.bc"
-llc -filetype=obj -relocation-model=static "$output/jeqy.bc" -o "$output/jeqy.o"
+opt -passes='default<O2>,verify' "$output/linked.bc" -o "$output/jeqy.bc"
+llc -O3 -filetype=obj -relocation-model=static "$output/jeqy.bc" -o "$output/jeqy.o"
 ld -static -e _start "$output/jeqy.o" -o "$output/jeqy"
 nm -u "$output/jeqy" > "$output/undefined-symbols.txt"
 test ! -s "$output/undefined-symbols.txt"

@@ -12,10 +12,34 @@
 @cli_halted = external global i1
 @j_deferred_input_error = external global ptr
 @j_gc_pressure = external global i64
+@j_gc_threshold = external global i64
 @j_collect_enabled = external global i1
 @g_next_depth = internal global i64 0
 @g_keyerror = private constant [33 x i8] c"Cannot use non-string object key\00"
 @g_generators = private constant [130 x i8] c"select\00range\00recurse\00recurse_down\00while\00until\00repeat\00first\00last\00nth\00limit\00skip\00isempty\00inputs\00any\00all\00fromstream\00truncate_stream\00\00"
+
+; --- fast generator dispatch ---
+; @ev_g_blob is a byte-exact copy of @g_generators above and @ev_g_ids a
+; precomputed FNV-1a open-addressing table (linear probing) mapping name hash
+; to the generator id, verified against the blob string on probe hit. Misses
+; and collisions fall back to the original b_find switch path, so behavior
+; cannot differ. The probe helper itself is @ev_name_id in eval.ll.
+@ev_g_blob = private constant [130 x i8] c"select\00range\00recurse\00recurse_down\00while\00until\00repeat\00first\00last\00nth\00limit\00skip\00isempty\00inputs\00any\00all\00fromstream\00truncate_stream\00\00"
+; Text builtins fast-pathed in @g_try_fast_depth. Ids here are local to this
+; table: 0/1 are the zero-arg ascii case converters, 2 is split, 3 is join and
+; 4-8 are the single-argument edge operations dispatched through @t_edge
+; (ltrimstr 4, rtrimstr 5, trimstr 6, startswith 7, endswith 8).
+@g_text_fast_names = private constant [86 x i8] c"ascii_downcase\00ascii_upcase\00split\00join\00ltrimstr\00rtrimstr\00trimstr\00startswith\00endswith\00\00"
+@ev_g_offs = private constant [18 x i32] [
+  i32 0, i32 7, i32 13, i32 21, i32 34, i32 40, i32 46, i32 53, i32 59, i32 64, i32 68, i32 74, i32 79, i32 87, i32 94, i32 98,
+  i32 102, i32 113
+]
+@ev_g_ids = private constant [64 x i32] [
+  i32 -1, i32 7, i32 2, i32 11, i32 15, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 14, i32 4, i32 5,
+  i32 -1, i32 -1, i32 1, i32 -1, i32 -1, i32 9, i32 -1, i32 -1, i32 13, i32 8, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1,
+  i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 17, i32 -1, i32 6, i32 -1, i32 -1, i32 0, i32 -1, i32 -1,
+  i32 -1, i32 -1, i32 -1, i32 3, i32 10, i32 16, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 12, i32 -1
+]
 @g_range_error = private constant [29 x i8] c"Range bounds must be numeric\00"
 @g_limit_error = private constant [37 x i8] c"limit doesn't support negative count\00"
 @g_skip_error = private constant [36 x i8] c"skip doesn't support negative count\00"
@@ -41,6 +65,7 @@ declare ptr @j_clone(ptr)
 declare void @j_put(ptr, ptr, ptr)
 declare ptr @j_get(ptr, ptr)
 declare i32 @j_cmp(ptr, ptr)
+declare i1 @j_str_eq(ptr, ptr)
 declare i1 @j_is(ptr, ptr)
 declare i1 @j_truth(ptr)
 declare ptr @j_binary(i32, ptr, ptr)
@@ -56,6 +81,8 @@ declare ptr @ev_patternnull(ptr, ptr)
 declare ptr @ev_importenv(ptr, ptr, ptr)
 declare void @ev_itererror(ptr)
 declare ptr @ev_slice(ptr, ptr, ptr)
+declare ptr @ev_lookup1or2(ptr, ptr, i64, ptr)
+declare i32 @ev_name_id(ptr, ptr, ptr, ptr, i32)
 declare i64 @b_len(ptr)
 declare ptr @b_data(ptr)
 declare i32 @b_find(ptr, ptr)
@@ -65,6 +92,12 @@ declare ptr @b_keys(ptr, i1)
 declare ptr @cli_take_input()
 declare void @j_collect(ptr)
 declare ptr @j_expand_builtin(ptr, ptr, ptr, ptr)
+declare ptr @b_fast_zero_arg(ptr, ptr, ptr)
+declare ptr @ev_try_fast_assign(ptr, ptr, i32, ptr, ptr, i32)
+declare ptr @t_ascii(ptr, i1)
+declare ptr @t_edge(i32, ptr, ptr)
+declare ptr @j_split(ptr, ptr)
+declare ptr @t_join(ptr, ptr)
 
 define internal ptr @g_work(ptr %iterator, i32 %kind, i32 %op, ptr %node, ptr %input, ptr %env, ptr %continuation, ptr %handler, ptr %a, ptr %b, i64 %index) {
   %work = call ptr @j_alloc(i64 80)
@@ -238,16 +271,35 @@ finish:
 define internal void @g_object(ptr %iterator, ptr %pairs, i64 %index, ptr %object, ptr %input, ptr %env, ptr %continuation, ptr %handler) {
 entry:
   %count = call i64 @b_len(ptr %pairs)
-  %done = icmp uge i64 %index, %count
-  br i1 %done, label %emit, label %pair
+  br label %fastloop
+fastloop:
+  %fi = phi i64 [ %index, %entry ], [ %fnext, %fastput ]
+  %done = icmp uge i64 %fi, %count
+  br i1 %done, label %emit, label %fastpair
+fastpair:
+  %key = call ptr @j_at(ptr %pairs, i64 %fi)
+  %vi = add i64 %fi, 1
+  %value = call ptr @j_at(ptr %pairs, i64 %vi)
+  %kfast = call ptr @g_try_fast(ptr %key, ptr %input, ptr %env)
+  %kok = icmp ne ptr %kfast, null
+  br i1 %kok, label %fastkeycheck, label %pair
+fastkeycheck:
+  %ktag = load i32, ptr %kfast
+  %kstr = icmp eq i32 %ktag, 4
+  br i1 %kstr, label %fastval, label %pair
+fastval:
+  %vfast = call ptr @g_try_fast(ptr %value, ptr %input, ptr %env)
+  %vok = icmp ne ptr %vfast, null
+  br i1 %vok, label %fastput, label %pair
+fastput:
+  call void @j_put(ptr %object, ptr %kfast, ptr %vfast)
+  %fnext = add i64 %fi, 2
+  br label %fastloop
 emit:
   %work = call ptr @g_work(ptr %iterator, i32 1, i32 0, ptr null, ptr %object, ptr %env, ptr %continuation, ptr %handler, ptr null, ptr null, i64 0)
   ret void
 pair:
-  %key = call ptr @j_at(ptr %pairs, i64 %index)
-  %vi = add i64 %index, 1
-  %value = call ptr @j_at(ptr %pairs, i64 %vi)
-  %cont = call ptr @g_cont(i32 12, i32 0, ptr %continuation, ptr %env, ptr %handler, ptr %pairs, ptr %object, ptr %input, ptr %value, i64 %index)
+  %cont = call ptr @g_cont(i32 12, i32 0, ptr %continuation, ptr %env, ptr %handler, ptr %pairs, ptr %object, ptr %input, ptr %value, i64 %fi)
   call void @g_schedule(ptr %iterator, ptr %key, ptr %input, ptr %env, ptr %cont, ptr %handler)
   ret void
 }
@@ -302,6 +354,316 @@ value:
   ret void
 }
 
+define ptr @g_try_fast(ptr %node, ptr %input, ptr %env) {
+entry:
+  %r = call ptr @g_try_fast_depth(ptr %node, ptr %input, ptr %env, i32 0)
+  ret ptr %r
+}
+
+define ptr @g_try_fast_depth(ptr %node, ptr %input, ptr %env, i32 %depth) {
+entry:
+  %cstatus = alloca i32
+  %nullnode = icmp eq ptr %node, null
+  %toodeep = icmp sgt i32 %depth, 128
+  %bail = or i1 %nullnode, %toodeep
+  br i1 %bail, label %fail, label %dispatch
+dispatch:
+  %kind = load i32, ptr %node
+  %opp = getelementptr %GN, ptr %node, i32 0, i32 1
+  %op = load i32, ptr %opp
+  %ap = getelementptr %GN, ptr %node, i32 0, i32 2
+  %a = load ptr, ptr %ap
+  %bp = getelementptr %GN, ptr %node, i32 0, i32 3
+  %b = load ptr, ptr %bp
+  %cp = getelementptr %GN, ptr %node, i32 0, i32 4
+  %c = load ptr, ptr %cp
+  %nextd = add i32 %depth, 1
+  switch i32 %kind, label %fail [
+    i32 0, label %lit
+    i32 1, label %id
+    i32 2, label %pipe
+    i32 4, label %bin
+    i32 5, label %fld
+    i32 7, label %call
+    i32 9, label %obj
+    i32 10, label %var
+    i32 11, label %bind
+    i32 13, label %cond
+    i32 15, label %neg
+    i32 19, label %assign
+  ]
+lit:
+  ret ptr %a
+id:
+  ret ptr %input
+var:
+  %ve = call ptr @ev_lookup(ptr %env, ptr %a, i32 0, i64 0)
+  %vfound = icmp ne ptr %ve, null
+  br i1 %vfound, label %varok, label %fail
+varok:
+  %vp = getelementptr %GE, ptr %ve, i32 0, i32 2
+  %vv = load ptr, ptr %vp
+  ret ptr %vv
+pipe:
+  %pmid = call ptr @g_try_fast_depth(ptr %a, ptr %input, ptr %env, i32 %nextd)
+  %pok = icmp ne ptr %pmid, null
+  br i1 %pok, label %piperhs, label %fail
+piperhs:
+  %pres = call ptr @g_try_fast_depth(ptr %b, ptr %pmid, ptr %env, i32 %nextd)
+  ret ptr %pres
+bin:
+  %islogic = icmp uge i32 %op, 11
+  br i1 %islogic, label %binlogic, label %binarith
+binlogic:
+  %llv = call ptr @g_try_fast_depth(ptr %a, ptr %input, ptr %env, i32 %nextd)
+  %llok = icmp ne ptr %llv, null
+  br i1 %llok, label %binlogiccheck, label %fail
+binlogiccheck:
+  %ltr = call i1 @j_truth(ptr %llv)
+  %isand = icmp eq i32 %op, 11
+  %lshort = xor i1 %ltr, %isand
+  br i1 %lshort, label %binlogicshort, label %binlogicrhs
+binlogicshort:
+  %lsres = call ptr @j_bool(i1 %ltr)
+  ret ptr %lsres
+binlogicrhs:
+  %lrv = call ptr @g_try_fast_depth(ptr %b, ptr %input, ptr %env, i32 %nextd)
+  %lrok = icmp ne ptr %lrv, null
+  br i1 %lrok, label %binlogicdone, label %fail
+binlogicdone:
+  %rtr = call i1 @j_truth(ptr %lrv)
+  %lrres = call ptr @j_bool(i1 %rtr)
+  ret ptr %lrres
+binarith:
+  %arv = call ptr @g_try_fast_depth(ptr %b, ptr %input, ptr %env, i32 %nextd)
+  %arok = icmp ne ptr %arv, null
+  br i1 %arok, label %binarithlhs, label %fail
+binarithlhs:
+  %alv = call ptr @g_try_fast_depth(ptr %a, ptr %input, ptr %env, i32 %nextd)
+  %alok = icmp ne ptr %alv, null
+  br i1 %alok, label %binarithapply, label %fail
+binarithapply:
+  %bres = call ptr @j_binary(i32 %op, ptr %alv, ptr %arv)
+  %berr = load ptr, ptr @j_error
+  %bhaserr = icmp ne ptr %berr, null
+  br i1 %bhaserr, label %clearfail, label %binarithok
+binarithok:
+  ret ptr %bres
+fld:
+  %flv = call ptr @g_try_fast_depth(ptr %a, ptr %input, ptr %env, i32 %nextd)
+  %flok = icmp ne ptr %flv, null
+  br i1 %flok, label %fldkey, label %fail
+fldkey:
+  %fkv = call ptr @g_try_fast_depth(ptr %b, ptr %input, ptr %env, i32 %nextd)
+  %fkok = icmp ne ptr %fkv, null
+  br i1 %fkok, label %fldget, label %fail
+fldget:
+  %fres = call ptr @j_get(ptr %flv, ptr %fkv)
+  %ferr = load ptr, ptr @j_error
+  %fhaserr = icmp ne ptr %ferr, null
+  br i1 %fhaserr, label %clearfail, label %fldok
+fldok:
+  ret ptr %fres
+cond:
+  %ccv = call ptr @g_try_fast_depth(ptr %a, ptr %input, ptr %env, i32 %nextd)
+  %ccok = icmp ne ptr %ccv, null
+  br i1 %ccok, label %condbranch, label %fail
+condbranch:
+  %ctr = call i1 @j_truth(ptr %ccv)
+  %cbr = select i1 %ctr, ptr %b, ptr %c
+  %cres = call ptr @g_try_fast_depth(ptr %cbr, ptr %input, ptr %env, i32 %nextd)
+  ret ptr %cres
+neg:
+  %nv = call ptr @g_try_fast_depth(ptr %a, ptr %input, ptr %env, i32 %nextd)
+  %nok = icmp ne ptr %nv, null
+  br i1 %nok, label %negapply, label %fail
+negapply:
+  %nres = call ptr @j_negate(ptr %nv)
+  %nerr = load ptr, ptr @j_error
+  %nhaserr = icmp ne ptr %nerr, null
+  br i1 %nhaserr, label %clearfail, label %negok
+negok:
+  ret ptr %nres
+bind:
+  %bpatkind = load i32, ptr %b
+  %bisvar = icmp eq i32 %bpatkind, 10
+  br i1 %bisvar, label %bindeval, label %fail
+bindeval:
+  %bval = call ptr @g_try_fast_depth(ptr %a, ptr %input, ptr %env, i32 %nextd)
+  %bok = icmp ne ptr %bval, null
+  br i1 %bok, label %bindbody, label %fail
+bindbody:
+  %bvnp = getelementptr %GN, ptr %b, i32 0, i32 2
+  %bvn = load ptr, ptr %bvnp
+  %benv = call ptr @j_bind(ptr %env, ptr %bvn, ptr %bval)
+  %bres2 = call ptr @g_try_fast_depth(ptr %c, ptr %input, ptr %benv, i32 %nextd)
+  ret ptr %bres2
+call:
+  %carity = call i64 @b_len(ptr %b)
+  %czero = icmp eq i64 %carity, 0
+  %cone = icmp eq i64 %carity, 1
+  br i1 %czero, label %callzero, label %callonecheck
+callonecheck:
+  br i1 %cone, label %callone, label %fail
+callone:
+  %c1tid = call i32 @b_find(ptr %a, ptr @g_text_fast_names)
+  %c1istext = icmp sge i32 %c1tid, 2
+  br i1 %c1istext, label %callonepriv, label %fail
+callonepriv:
+  %c1priv = icmp sle i32 %op, -2
+  br i1 %c1priv, label %callonearg, label %calloneshadow
+calloneshadow:
+  %c1fn = call ptr @ev_lookup(ptr %env, ptr %a, i32 1, i64 1)
+  %c1hasfn = icmp ne ptr %c1fn, null
+  %c1fl = call ptr @ev_lookup(ptr %env, ptr %a, i32 2, i64 0)
+  %c1hasfl = icmp ne ptr %c1fl, null
+  %c1shadowed = or i1 %c1hasfn, %c1hasfl
+  br i1 %c1shadowed, label %fail, label %callonearg
+callonearg:
+  %c1argast = call ptr @j_at(ptr %b, i64 0)
+  %c1argv = call ptr @g_try_fast_depth(ptr %c1argast, ptr %input, ptr %env, i32 %nextd)
+  %c1argok = icmp ne ptr %c1argv, null
+  br i1 %c1argok, label %callonedispatch, label %fail
+callonedispatch:
+  switch i32 %c1tid, label %clearfail [
+    i32 2, label %c1split
+    i32 3, label %c1join
+    i32 4, label %c1edge
+    i32 5, label %c1edge
+    i32 6, label %c1edge
+    i32 7, label %c1edge
+    i32 8, label %c1edge
+  ]
+c1split:
+  %c1stag = load i32, ptr %input
+  %c1sinstr = icmp eq i32 %c1stag, 4
+  %c1satag = load i32, ptr %c1argv
+  %c1sargstr = icmp eq i32 %c1satag, 4
+  %c1spok = and i1 %c1sinstr, %c1sargstr
+  br i1 %c1spok, label %c1splitdo, label %clearfail
+c1splitdo:
+  %c1spres = call ptr @j_split(ptr %input, ptr %c1argv)
+  ret ptr %c1spres
+c1join:
+  %c1jtag = load i32, ptr %input
+  %c1jin = icmp eq i32 %c1jtag, 5
+  %c1jatag = load i32, ptr %c1argv
+  %c1jsep = icmp eq i32 %c1jatag, 4
+  %c1jok = and i1 %c1jin, %c1jsep
+  br i1 %c1jok, label %c1joindo, label %clearfail
+c1joindo:
+  %c1jres = call ptr @t_join(ptr %input, ptr %c1argv)
+  %c1jerr = load ptr, ptr @j_error
+  %c1jbad = icmp ne ptr %c1jerr, null
+  br i1 %c1jbad, label %clearfail, label %c1jret
+c1jret:
+  ret ptr %c1jres
+c1edge:
+  %c1etag = load i32, ptr %input
+  %c1ein = icmp eq i32 %c1etag, 4
+  %c1eatag = load i32, ptr %c1argv
+  %c1earg = icmp eq i32 %c1eatag, 4
+  %c1eok = and i1 %c1ein, %c1earg
+  br i1 %c1eok, label %c1edgedo, label %clearfail
+c1edgedo:
+  %c1elow = icmp ule i32 %c1tid, 6
+  %c1elowid = add i32 %c1tid, 4
+  %c1ehighid = sub i32 %c1tid, 1
+  %c1eid = select i1 %c1elow, i32 %c1elowid, i32 %c1ehighid
+  %c1eres = call ptr @t_edge(i32 %c1eid, ptr %input, ptr %c1argv)
+  ret ptr %c1eres
+callzero:
+  %cpriv = icmp sle i32 %op, -2
+  br i1 %cpriv, label %callbuiltin, label %calluser
+calluser:
+  %cfn = call ptr @ev_lookup(ptr %env, ptr %a, i32 1, i64 0)
+  %chasfn = icmp ne ptr %cfn, null
+  br i1 %chasfn, label %callfn, label %callfilter
+callfn:
+  %cfbodyp = getelementptr %GE, ptr %cfn, i32 0, i32 2
+  %cfbody = load ptr, ptr %cfbodyp
+  %cfcapp = getelementptr %GE, ptr %cfn, i32 0, i32 5
+  %cfcap = load ptr, ptr %cfcapp
+  %cfres = call ptr @g_try_fast_depth(ptr %cfbody, ptr %input, ptr %cfcap, i32 %nextd)
+  ret ptr %cfres
+callfilter:
+  %cfl = call ptr @ev_lookup(ptr %env, ptr %a, i32 2, i64 0)
+  %chasfl = icmp ne ptr %cfl, null
+  br i1 %chasfl, label %callfl, label %callbuiltin
+callfl:
+  %cflbodyp = getelementptr %GE, ptr %cfl, i32 0, i32 2
+  %cflbody = load ptr, ptr %cflbodyp
+  %cflenvp = getelementptr %GE, ptr %cfl, i32 0, i32 5
+  %cflenv = load ptr, ptr %cflenvp
+  %cflres = call ptr @g_try_fast_depth(ptr %cflbody, ptr %input, ptr %cflenv, i32 %nextd)
+  ret ptr %cflres
+callbuiltin:
+  store i32 0, ptr %cstatus
+  %cbres = call ptr @b_fast_zero_arg(ptr %a, ptr %input, ptr %cstatus)
+  %cst = load i32, ptr %cstatus
+  %csingle = icmp eq i32 %cst, 1
+  %cberr = load ptr, ptr @j_error
+  %cbnoerr = icmp eq ptr %cberr, null
+  %cbok = and i1 %csingle, %cbnoerr
+  br i1 %cbok, label %callbuiltinok, label %calltextcheck
+callbuiltinok:
+  ret ptr %cbres
+calltextcheck:
+  %ctnoerr = icmp eq ptr %cberr, null
+  br i1 %ctnoerr, label %calltext, label %clearfail
+calltext:
+  %ctid = call i32 @b_find(ptr %a, ptr @g_text_fast_names)
+  %ctdown = icmp eq i32 %ctid, 0
+  %ctup = icmp eq i32 %ctid, 1
+  %ctascii = or i1 %ctdown, %ctup
+  br i1 %ctascii, label %calltextascii, label %clearfail
+calltextascii:
+  %cttag = load i32, ptr %input
+  %ctstr = icmp eq i32 %cttag, 4
+  br i1 %ctstr, label %calltextasciido, label %clearfail
+calltextasciido:
+  %ctupper = icmp eq i32 %ctid, 1
+  %ctres = call ptr @t_ascii(ptr %input, i1 %ctupper)
+  ret ptr %ctres
+obj:
+  %ocount = call i64 @b_len(ptr %a)
+  %oobj = call ptr @j_object()
+  br label %objloop
+objloop:
+  %oi = phi i64 [ 0, %obj ], [ %onext, %objput ]
+  %odone = icmp uge i64 %oi, %ocount
+  br i1 %odone, label %objdone, label %objpair
+objpair:
+  %okeyast = call ptr @j_at(ptr %a, i64 %oi)
+  %ovi = add i64 %oi, 1
+  %ovalast = call ptr @j_at(ptr %a, i64 %ovi)
+  %okv = call ptr @g_try_fast_depth(ptr %okeyast, ptr %input, ptr %env, i32 %nextd)
+  %okok = icmp ne ptr %okv, null
+  br i1 %okok, label %objkeycheck, label %fail
+objkeycheck:
+  %oktag = load i32, ptr %okv
+  %okstr = icmp eq i32 %oktag, 4
+  br i1 %okstr, label %objval, label %fail
+objval:
+  %ovv = call ptr @g_try_fast_depth(ptr %ovalast, ptr %input, ptr %env, i32 %nextd)
+  %ovok = icmp ne ptr %ovv, null
+  br i1 %ovok, label %objput, label %fail
+objput:
+  call void @j_put(ptr %oobj, ptr %okv, ptr %ovv)
+  %onext = add i64 %oi, 2
+  br label %objloop
+objdone:
+  ret ptr %oobj
+assign:
+  %ares = call ptr @ev_try_fast_assign(ptr %a, ptr %b, i32 %op, ptr %input, ptr %env, i32 %nextd)
+  ret ptr %ares
+clearfail:
+  store ptr null, ptr @j_error
+  ret ptr null
+fail:
+  ret ptr null
+}
+
 define ptr @j_iter(ptr %node, ptr %input, ptr %env) {
   %iterator = call ptr @j_alloc(i64 8)
   call void @g_schedule(ptr %iterator, ptr %node, ptr %input, ptr %env, ptr null, ptr null)
@@ -323,6 +685,8 @@ entry:
   %currentvalue = alloca ptr
   %currentcont = alloca ptr
   %currenthandler = alloca ptr
+  %fzstatus = alloca i32
+  %gkindslot = alloca i32
   store ptr null, ptr %currenthandler
   %priorerror = load ptr, ptr @j_error
   %priorbreak = load ptr, ptr @ev_break_name
@@ -334,7 +698,8 @@ loop:
   %enabled = load i1, ptr @j_collect_enabled
   %safe = and i1 %enabled, %toplevel
   %pressure = load i64, ptr @j_gc_pressure
-  %needed = icmp uge i64 %pressure, 8388608
+  %threshold = load i64, ptr @j_gc_threshold
+  %needed = icmp uge i64 %pressure, %threshold
   %collect = and i1 %safe, %needed
   br i1 %collect, label %collection, label %jobs
 collection:
@@ -553,8 +918,6 @@ treeenter:
   %treehaschildren = and i1 %treecontainer, %treenonempty
   br i1 %treehaschildren, label %treeexpand, label %treevisit
 treeexpand:
-  %treekeys = call ptr @b_keys(ptr %input, i1 false)
-  store ptr %treekeys, ptr %wbp
   store i64 0, ptr %wxp
   %treetail = load ptr, ptr %iterator
   store ptr %treetail, ptr %work
@@ -588,12 +951,31 @@ treepathyield:
   store ptr %wa, ptr %currentvalue
   br label %emit
 treechildren:
-  %treekeyn = call i64 @b_len(ptr %wb)
+  %treekeyn = call i64 @b_len(ptr %input)
   %treeclosed = icmp uge i64 %index, %treekeyn
   br i1 %treeclosed, label %treeclose, label %treechild
 treechild:
-  %treekey = call ptr @j_at(ptr %wb, i64 %index)
-  %treechildvalue = call ptr @j_get(ptr %input, ptr %treekey)
+  %tctag = load i32, ptr %input
+  %tcisobj = icmp eq i32 %tctag, 6
+  %tcdata = call ptr @b_data(ptr %input)
+  br i1 %tcisobj, label %treechildobj, label %treechildarr
+treechildobj:
+  %tcoi = shl i64 %index, 1
+  %tcovi = add i64 %tcoi, 1
+  %tcokp = getelementptr ptr, ptr %tcdata, i64 %tcoi
+  %tcovp = getelementptr ptr, ptr %tcdata, i64 %tcovi
+  %tcokey = load ptr, ptr %tcokp
+  %tcoval = load ptr, ptr %tcovp
+  br label %treechildready
+treechildarr:
+  %tcaf = sitofp i64 %index to double
+  %tcakey = call ptr @j_num(double %tcaf)
+  %tcavp = getelementptr ptr, ptr %tcdata, i64 %index
+  %tcaval = load ptr, ptr %tcavp
+  br label %treechildready
+treechildready:
+  %treekey = phi ptr [ %tcokey, %treechildobj ], [ %tcakey, %treechildarr ]
+  %treechildvalue = phi ptr [ %tcoval, %treechildobj ], [ %tcaval, %treechildarr ]
   %treechildpath = call ptr @j_clone(ptr %wa)
   call void @j_push(ptr %treechildpath, ptr %treekey)
   %treenext = add i64 %index, 1
@@ -606,7 +988,23 @@ treechild:
 treeclose:
   br i1 %treeisstream, label %treecloseevent, label %loop
 treecloseevent:
-  %treelastkey = call ptr @j_at(ptr %wb, i64 -1)
+  %tcelen = call i64 @b_len(ptr %input)
+  %tcelast = sub i64 %tcelen, 1
+  %tcetag = load i32, ptr %input
+  %tceisobj = icmp eq i32 %tcetag, 6
+  br i1 %tceisobj, label %treecloseobj, label %treeclosearr
+treecloseobj:
+  %tcedata = call ptr @b_data(ptr %input)
+  %tceoi = shl i64 %tcelast, 1
+  %tcekp = getelementptr ptr, ptr %tcedata, i64 %tceoi
+  %tceokey = load ptr, ptr %tcekp
+  br label %treecloseready
+treeclosearr:
+  %tceaf = sitofp i64 %tcelast to double
+  %tceakey = call ptr @j_num(double %tceaf)
+  br label %treecloseready
+treecloseready:
+  %treelastkey = phi ptr [ %tceokey, %treecloseobj ], [ %tceakey, %treeclosearr ]
   %treelastpath = call ptr @j_clone(ptr %wa)
   call void @j_push(ptr %treelastpath, ptr %treelastkey)
   %treeclosing = call ptr @j_array()
@@ -637,7 +1035,55 @@ reduceitem:
   %reduceupdate = load ptr, ptr %reduceupdatep
   %reduceextractp = getelementptr %GN, ptr %node, i32 0, i32 6
   %reduceextract = load ptr, ptr %reduceextractp
-  %reducedenv = call ptr @ev_bindpattern(ptr %env, ptr %reducepattern, ptr %reduceditem, ptr %input)
+  %isreduce = icmp ne i32 %wop, 280
+  %rpatkind = load i32, ptr %reducepattern
+  %risvarpat = icmp eq i32 %rpatkind, 10
+  %rwblen = call i64 @b_len(ptr %wb)
+  %risone = icmp eq i64 %rwblen, 1
+  %rcanfast0 = and i1 %isreduce, %risvarpat
+  %rcanfast = and i1 %rcanfast0, %risone
+  br i1 %rcanfast, label %reducefastsetup, label %reduceslow
+reducefastsetup:
+  %rvnamep = getelementptr %GN, ptr %reducepattern, i32 0, i32 2
+  %rvname = load ptr, ptr %rvnamep
+  %rfastenv = call ptr @j_bind(ptr %env, ptr %rvname, ptr %reduceditem)
+  %rfastvalp = getelementptr %GE, ptr %rfastenv, i32 0, i32 2
+  %rwbdata = call ptr @b_data(ptr %wb)
+  br label %reducefasttry
+reducefasttry:
+  %rcuritem = phi ptr [ %reduceditem, %reducefastsetup ], [ %rnextitem, %reducefastnextok ]
+  store ptr %rcuritem, ptr %rfastvalp
+  %rcurstate = load ptr, ptr %rwbdata
+  %rnextstate = call ptr @g_try_fast(ptr %reduceupdate, ptr %rcurstate, ptr %rfastenv)
+  %rfastok = icmp ne ptr %rnextstate, null
+  br i1 %rfastok, label %reducefaststore, label %reduceslow
+reducefaststore:
+  store ptr %rnextstate, ptr %rwbdata
+  %rpress = load i64, ptr @j_gc_pressure
+  %rthresh = load i64, ptr @j_gc_threshold
+  %rneedgc = icmp uge i64 %rpress, %rthresh
+  br i1 %rneedgc, label %reducefastyield, label %reducefastnext
+reducefastnext:
+  %rnextitem = call ptr @j_next(ptr %wa)
+  %rnexterr = load ptr, ptr @j_error
+  %rnexthaserr = icmp ne ptr %rnexterr, null
+  %rnextbrk = load ptr, ptr @ev_break_name
+  %rnexthasbrk = icmp ne ptr %rnextbrk, null
+  %rnextfail = or i1 %rnexthaserr, %rnexthasbrk
+  br i1 %rnextfail, label %raise, label %reducefastnextcheck
+reducefastnextcheck:
+  %rnextend = icmp eq ptr %rnextitem, null
+  br i1 %rnextend, label %reducedone, label %reducefastnextok
+reducefastnextok:
+  br label %reducefasttry
+reducefastyield:
+  %rytail = load ptr, ptr %iterator
+  store ptr %rytail, ptr %work
+  store ptr %work, ptr %iterator
+  br label %loop
+reduceslow:
+  %rslowitem = phi ptr [ %reduceditem, %reduceitem ], [ %rcuritem, %reducefasttry ]
+  %reducedenv = call ptr @ev_bindpattern(ptr %env, ptr %reducepattern, ptr %rslowitem, ptr %input)
   %reducenew = call ptr @j_array()
   store ptr %reducenew, ptr %wbp
   %reducetail = load ptr, ptr %iterator
@@ -661,14 +1107,35 @@ dispatch:
   %c = load ptr, ptr %cp
   %dp = getelementptr %GN, ptr %node, i32 0, i32 5
   %d = load ptr, ptr %dp
-  switch i32 %kind, label %atom [ i32 0, label %literal i32 1, label %identity i32 2, label %pipe i32 3, label %comma i32 4, label %binary i32 5, label %field i32 6, label %iterate i32 7, label %call i32 8, label %array i32 9, label %object i32 11, label %binding i32 12, label %definition i32 13, label %conditional i32 14, label %try i32 15, label %negative i32 16, label %optional i32 17, label %recursivedefault i32 18, label %reduce i32 19, label %assignment i32 20, label %slice i32 21, label %alternative i32 22, label %label i32 23, label %break i32 24, label %import i32 25, label %module i32 100, label %repeatstep i32 101, label %recursestep i32 102, label %whilestep i32 103, label %rangestep ]
+  switch i32 %kind, label %atom [ i32 0, label %literal i32 1, label %identity i32 2, label %pipe i32 3, label %comma i32 4, label %binary i32 5, label %field i32 6, label %iterate i32 7, label %call i32 8, label %array i32 9, label %object i32 10, label %variable i32 11, label %binding i32 12, label %definition i32 13, label %conditional i32 14, label %try i32 15, label %negative i32 16, label %optional i32 17, label %recursivedefault i32 18, label %reduce i32 19, label %assignment i32 20, label %slice i32 21, label %alternative i32 22, label %label i32 23, label %break i32 24, label %import i32 25, label %module i32 100, label %repeatstep i32 101, label %recursestep i32 102, label %whilestep i32 103, label %rangestep ]
 literal:
   store ptr %a, ptr %currentvalue
   br label %emit
 identity:
   store ptr %input, ptr %currentvalue
   br label %emit
+variable:
+  %vfast = call ptr @g_try_fast(ptr %node, ptr %input, ptr %env)
+  %vfastok = icmp ne ptr %vfast, null
+  br i1 %vfastok, label %variableemit, label %atom
+variableemit:
+  store ptr %vfast, ptr %currentvalue
+  br label %emit
 pipe:
+  %pfast = call ptr @g_try_fast(ptr %node, ptr %input, ptr %env)
+  %pfastok = icmp ne ptr %pfast, null
+  br i1 %pfastok, label %pipefastemit, label %pipelhs
+pipefastemit:
+  store ptr %pfast, ptr %currentvalue
+  br label %emit
+pipelhs:
+  %plhsfast = call ptr @g_try_fast(ptr %a, ptr %input, ptr %env)
+  %plhsok = icmp ne ptr %plhsfast, null
+  br i1 %plhsok, label %pipelhsdirect, label %pipeslow
+pipelhsdirect:
+  call void @g_schedule(ptr %iterator, ptr %b, ptr %plhsfast, ptr %env, ptr %continuation, ptr %handler)
+  br label %loop
+pipeslow:
   %pk = call ptr @g_cont(i32 1, i32 0, ptr %continuation, ptr %env, ptr %handler, ptr %b, ptr null, ptr null, ptr null, i64 0)
   call void @g_schedule(ptr %iterator, ptr %a, ptr %input, ptr %env, ptr %pk, ptr %handler)
   br label %loop
@@ -677,6 +1144,13 @@ comma:
   call void @g_schedule(ptr %iterator, ptr %a, ptr %input, ptr %env, ptr %continuation, ptr %handler)
   br label %loop
 binary:
+  %bfast = call ptr @g_try_fast(ptr %node, ptr %input, ptr %env)
+  %bfastok = icmp ne ptr %bfast, null
+  br i1 %bfastok, label %binaryfastemit, label %binaryslow
+binaryfastemit:
+  store ptr %bfast, ptr %currentvalue
+  br label %emit
+binaryslow:
   %logical = icmp uge i32 %op, 11
   %outer = select i1 %logical, ptr %a, ptr %b
   %inner = select i1 %logical, ptr %b, ptr %a
@@ -684,6 +1158,13 @@ binary:
   call void @g_schedule(ptr %iterator, ptr %outer, ptr %input, ptr %env, ptr %bk, ptr %handler)
   br label %loop
 field:
+  %ffast = call ptr @g_try_fast(ptr %node, ptr %input, ptr %env)
+  %ffastok = icmp ne ptr %ffast, null
+  br i1 %ffastok, label %fieldfastemit, label %fieldslow
+fieldfastemit:
+  store ptr %ffast, ptr %currentvalue
+  br label %emit
+fieldslow:
   %fk = call ptr @g_cont(i32 4, i32 0, ptr %continuation, ptr %env, ptr %handler, ptr %b, ptr %input, ptr null, ptr null, i64 0)
   call void @g_schedule(ptr %iterator, ptr %a, ptr %input, ptr %env, ptr %fk, ptr %handler)
   br label %loop
@@ -702,6 +1183,13 @@ object:
   call void @g_object(ptr %iterator, ptr %a, i64 0, ptr %newobject, ptr %input, ptr %env, ptr %continuation, ptr %handler)
   br label %loop
 binding:
+  %bindfast = call ptr @g_try_fast(ptr %node, ptr %input, ptr %env)
+  %bindfastok = icmp ne ptr %bindfast, null
+  br i1 %bindfastok, label %bindingfastemit, label %bindingslow
+bindingfastemit:
+  store ptr %bindfast, ptr %currentvalue
+  br label %emit
+bindingslow:
   %bindk = call ptr @g_cont(i32 8, i32 0, ptr %continuation, ptr %env, ptr %handler, ptr %b, ptr %c, ptr %input, ptr null, i64 0)
   call void @g_schedule(ptr %iterator, ptr %a, ptr %input, ptr %env, ptr %bindk, ptr %handler)
   br label %loop
@@ -716,6 +1204,22 @@ definition:
   call void @g_schedule(ptr %iterator, ptr %d, ptr %input, ptr %de, ptr %continuation, ptr %handler)
   br label %loop
 conditional:
+  %cfast = call ptr @g_try_fast(ptr %node, ptr %input, ptr %env)
+  %cfastok = icmp ne ptr %cfast, null
+  br i1 %cfastok, label %condfastemit, label %condtrycond
+condfastemit:
+  store ptr %cfast, ptr %currentvalue
+  br label %emit
+condtrycond:
+  %ccondfast = call ptr @g_try_fast(ptr %a, ptr %input, ptr %env)
+  %ccondok = icmp ne ptr %ccondfast, null
+  br i1 %ccondok, label %condfastbranch, label %condslow
+condfastbranch:
+  %ccondtr = call i1 @j_truth(ptr %ccondfast)
+  %ccondbr = select i1 %ccondtr, ptr %b, ptr %c
+  call void @g_schedule(ptr %iterator, ptr %ccondbr, ptr %input, ptr %env, ptr %continuation, ptr %handler)
+  br label %loop
+condslow:
   %ck = call ptr @g_cont(i32 9, i32 0, ptr %continuation, ptr %env, ptr %handler, ptr %b, ptr %c, ptr %input, ptr null, i64 0)
   call void @g_schedule(ptr %iterator, ptr %a, ptr %input, ptr %env, ptr %ck, ptr %handler)
   br label %loop
@@ -761,6 +1265,13 @@ slice:
   call void @g_schedule(ptr %iterator, ptr %a, ptr %input, ptr %env, ptr %slicek, ptr %handler)
   br label %loop
 assignment:
+  %assignfast = call ptr @ev_try_fast_assign(ptr %a, ptr %b, i32 %op, ptr %input, ptr %env, i32 0)
+  %assignfastok = icmp ne ptr %assignfast, null
+  br i1 %assignfastok, label %assignfastemit, label %assigncheck
+assignfastemit:
+  store ptr %assignfast, ptr %currentvalue
+  br label %emit
+assigncheck:
   %plainassign = icmp eq i32 %op, 61
   %compoundlow = icmp uge i32 %op, 266
   %compoundhigh = icmp ule i32 %op, 270
@@ -776,33 +1287,44 @@ call:
   %privatebuiltin = icmp sle i32 %op, -2
   br i1 %privatebuiltin, label %generatorlookup, label %userlookup
 userlookup:
-  %function = call ptr @ev_lookup(ptr %env, ptr %a, i32 1, i64 %arity)
-  %foundfunction = icmp ne ptr %function, null
-  br i1 %foundfunction, label %usercall, label %filterlookup
+  %gkind = call ptr @ev_lookup1or2(ptr %env, ptr %a, i64 %arity, ptr %gkindslot)
+  %gk = load i32, ptr %gkindslot
+  %gkfunc = icmp eq i32 %gk, 1
+  br i1 %gkfunc, label %usercall, label %gkflcheck
+gkflcheck:
+  %gkfilter = icmp eq i32 %gk, 2
+  br i1 %gkfilter, label %filtercall, label %generatorlookup
 usercall:
-  %bodyp = getelementptr %GE, ptr %function, i32 0, i32 2
+  %bodyp = getelementptr %GE, ptr %gkind, i32 0, i32 2
   %body = load ptr, ptr %bodyp
-  %paramsp = getelementptr %GE, ptr %function, i32 0, i32 4
+  %paramsp = getelementptr %GE, ptr %gkind, i32 0, i32 4
   %params = load ptr, ptr %paramsp
-  %capturep = getelementptr %GE, ptr %function, i32 0, i32 5
+  %capturep = getelementptr %GE, ptr %gkind, i32 0, i32 5
   %capture = load ptr, ptr %capturep
   call void @g_callargs(ptr %iterator, ptr %body, ptr %params, ptr %b, i64 0, ptr %input, ptr %env, ptr %capture, ptr %continuation, ptr %handler)
   br label %loop
-filterlookup:
-  %filter = call ptr @ev_lookup(ptr %env, ptr %a, i32 2, i64 0)
-  %foundfilter = icmp ne ptr %filter, null
-  br i1 %foundfilter, label %filtercall, label %generatorlookup
 filtercall:
-  %filterbodyp = getelementptr %GE, ptr %filter, i32 0, i32 2
+  %filterbodyp = getelementptr %GE, ptr %gkind, i32 0, i32 2
   %filterbody = load ptr, ptr %filterbodyp
-  %filterenvp = getelementptr %GE, ptr %filter, i32 0, i32 5
+  %filterenvp = getelementptr %GE, ptr %gkind, i32 0, i32 5
   %filterenv = load ptr, ptr %filterenvp
   call void @g_schedule(ptr %iterator, ptr %filterbody, ptr %input, ptr %filterenv, ptr %continuation, ptr %handler)
   br label %loop
 generatorlookup:
-  %gid = call i32 @b_find(ptr %a, ptr @g_generators)
+  %gid = call i32 @ev_name_id(ptr %a, ptr @ev_g_blob, ptr @ev_g_offs, ptr @ev_g_ids, i32 64)
   switch i32 %gid, label %nativecall [ i32 0, label %selectcall i32 1, label %rangecall i32 2, label %recursecall i32 3, label %recursecall i32 4, label %whilecall i32 5, label %whilecall i32 6, label %repeatcall i32 7, label %consumecall i32 8, label %consumecall i32 9, label %quotacall i32 10, label %quotacall i32 11, label %quotacall i32 12, label %consumecall i32 13, label %inputscall i32 14, label %anyallcall i32 15, label %anyallcall i32 16, label %fromstreamcall i32 17, label %truncatecall ]
 nativecall:
+  %iszeroarg = icmp eq i64 %arity, 0
+  br i1 %iszeroarg, label %nativefastzero, label %nativeexpand
+nativefastzero:
+  store i32 0, ptr %fzstatus
+  %fzval = call ptr @b_fast_zero_arg(ptr %a, ptr %input, ptr %fzstatus)
+  %fzst = load i32, ptr %fzstatus
+  switch i32 %fzst, label %nativeexpand [ i32 1, label %nativefastemit i32 2, label %loop ]
+nativefastemit:
+  store ptr %fzval, ptr %currentvalue
+  br label %emitcheck
+nativeexpand:
   %expansion = call ptr @j_expand_builtin(ptr %a, ptr %b, ptr %input, ptr %env)
   %expanded = icmp ne ptr %expansion, null
   br i1 %expanded, label %expandedcall, label %treecheck
@@ -858,11 +1380,12 @@ nativecheck:
   %nativeboundprivate = icmp eq i32 %op, -3
   %nativebound = or i1 %nativeboundpublic, %nativeboundprivate
   %noargs = icmp eq i64 %arity, 0
+  %nativebasic = or i1 %nativebound, %noargs
+  br i1 %nativebasic, label %atom, label %nativemaskcheck
+nativemaskcheck:
   %valueargmask = call i64 @g_value_mask(ptr %a)
   %nofilterargs = icmp eq i64 %valueargmask, 0
-  %nativebasic = or i1 %nativebound, %noargs
-  %nativeplain = or i1 %nativebasic, %nofilterargs
-  br i1 %nativeplain, label %atom, label %nativeargs
+  br i1 %nofilterargs, label %atom, label %nativeargs
 nativeargs:
   %reverseargid = call i32 @b_find(ptr %a, ptr @g_reverse_args)
   %reverseargorder = icmp sge i32 %reverseargid, 0
@@ -911,6 +1434,16 @@ truncatecall:
   br label %loop
 selectcall:
   %selectast = call ptr @j_at(ptr %b, i64 0)
+  %selfast = call ptr @g_try_fast(ptr %selectast, ptr %input, ptr %env)
+  %selfastok = icmp ne ptr %selfast, null
+  br i1 %selfastok, label %selectfastcheck, label %selectslow
+selectfastcheck:
+  %seltr = call i1 @j_truth(ptr %selfast)
+  br i1 %seltr, label %selectfastemit, label %loop
+selectfastemit:
+  store ptr %input, ptr %currentvalue
+  br label %emit
+selectslow:
   %selectk = call ptr @g_cont(i32 15, i32 0, ptr %continuation, ptr %env, ptr %handler, ptr %input, ptr null, ptr null, ptr null, i64 0)
   call void @g_schedule(ptr %iterator, ptr %selectast, ptr %input, ptr %env, ptr %selectk, ptr %handler)
   br label %loop
@@ -945,12 +1478,29 @@ recurseready:
   call void @g_schedule(ptr %iterator, ptr %recursenode, ptr %input, ptr %env, ptr %continuation, ptr %handler)
   br label %loop
 recursivedefault:
-  %rid = call ptr @ev_node(i32 1, i32 0, ptr null, ptr null, ptr null, ptr null)
-  %riter = call ptr @ev_node(i32 6, i32 0, ptr %rid, ptr null, ptr null, ptr null)
-  %ropt = call ptr @ev_node(i32 16, i32 0, ptr %riter, ptr null, ptr null, ptr null)
-  %rdefault = call ptr @ev_node(i32 101, i32 0, ptr %ropt, ptr null, ptr null, ptr null)
-  call void @g_schedule(ptr %iterator, ptr %rdefault, ptr %input, ptr %env, ptr %continuation, ptr %handler)
-  br label %loop
+  %rdeftag = load i32, ptr %input
+  %rdefarr = icmp eq i32 %rdeftag, 5
+  %rdefobj = icmp eq i32 %rdeftag, 6
+  %rdefcont = or i1 %rdefarr, %rdefobj
+  br i1 %rdefcont, label %recursivedefaultlen, label %recursivedefaultemit
+recursivedefaultlen:
+  %rdeflen = call i64 @b_len(ptr %input)
+  %rdefnonempty = icmp ugt i64 %rdeflen, 0
+  br i1 %rdefnonempty, label %recursivedefaultpush, label %recursivedefaultemit
+recursivedefaultpush:
+  %rdefisk17 = icmp eq i32 %kind, 17
+  br i1 %rdefisk17, label %recursivedefaultnodeok, label %recursivedefaultmakenode
+recursivedefaultmakenode:
+  %rdefnew = call ptr @ev_node(i32 17, i32 0, ptr null, ptr null, ptr null, ptr null)
+  br label %recursivedefaultnodeok
+recursivedefaultnodeok:
+  %rdefnode = phi ptr [ %node, %recursivedefaultpush ], [ %rdefnew, %recursivedefaultmakenode ]
+  %rdefk = call ptr @g_cont(i32 1, i32 0, ptr %continuation, ptr %env, ptr %handler, ptr %rdefnode, ptr null, ptr null, ptr null, i64 0)
+  call void @g_values(ptr %iterator, ptr %input, ptr %rdefk, ptr %handler)
+  br label %recursivedefaultemit
+recursivedefaultemit:
+  store ptr %input, ptr %currentvalue
+  br label %emit
 whilecall:
   %condast = call ptr @j_at(ptr %b, i64 0)
   %updateast = call ptr @j_at(ptr %b, i64 1)
@@ -1003,7 +1553,9 @@ rangeemit:
   %rangeincrement = fadd double %rangevalue, %rangestepvalue
   %rangeupdated = call ptr @j_num(double %rangeincrement)
   store ptr %rangeupdated, ptr %ap
-  call void @g_schedule(ptr %iterator, ptr %node, ptr %input, ptr %env, ptr %continuation, ptr %handler)
+  %rangerest = load ptr, ptr %iterator
+  store ptr %rangerest, ptr %work
+  store ptr %work, ptr %iterator
   store ptr %a, ptr %currentvalue
   br label %emit
 consumecall:
@@ -1030,12 +1582,20 @@ atom:
   %haserror = icmp ne ptr %pendingerror, null
   %hasbreak = icmp ne ptr %pendingbreak, null
   %haspending = or i1 %haserror, %hasbreak
-  br i1 %haspending, label %defererror, label %atomvalues
+  br i1 %haspending, label %defererror, label %atomfastcheck
 defererror:
   store ptr null, ptr @j_error
   store ptr null, ptr @ev_break_name
   %errorjob = call ptr @g_work(ptr %iterator, i32 4, i32 0, ptr null, ptr %pendingerror, ptr %env, ptr %continuation, ptr %handler, ptr %pendingbreak, ptr null, i64 0)
   br label %atomvalues
+atomfastcheck:
+  %avlen = call i64 @b_len(ptr %values)
+  switch i64 %avlen, label %atomvalues [ i64 0, label %loop i64 1, label %atomsingle ]
+atomsingle:
+  %avdata = call ptr @b_data(ptr %values)
+  %av0 = load ptr, ptr %avdata
+  store ptr %av0, ptr %currentvalue
+  br label %emit
 atomvalues:
   call void @g_values(ptr %iterator, ptr %values, ptr %continuation, ptr %handler)
   br label %loop
@@ -1420,9 +1980,19 @@ handlercheck:
 breakhandler:
   br i1 %islabel, label %labelmatch, label %handlernext
 labelmatch:
-  %labelcmp = call i32 @j_cmp(ptr %labelname, ptr %broken)
-  %matchinglabel = icmp eq i32 %labelcmp, 0
+  %lcatag = load i32, ptr %labelname
+  %lbntag = load i32, ptr %broken
+  %lcastreq = icmp eq i32 %lcatag, 4
+  %lbntstreq = icmp eq i32 %lbntag, 4
+  %lcbothstr = and i1 %lcastreq, %lbntstreq
+  br i1 %lcbothstr, label %labelstreq, label %labelgen
+labelstreq:
+  %matchinglabel = call i1 @j_str_eq(ptr %labelname, ptr %broken)
   br i1 %matchinglabel, label %caughtbreak, label %handlernext
+labelgen:
+  %labelcmp = call i32 @j_cmp(ptr %labelname, ptr %broken)
+  %matchinglabel2 = icmp eq i32 %labelcmp, 0
+  br i1 %matchinglabel2, label %caughtbreak, label %handlernext
 errorhandler:
   br i1 %islabel, label %handlernext, label %caughterror
 handlernext:

@@ -3,6 +3,7 @@
 %RC = type { ptr, ptr, ptr, i64, i32, i32, ptr, i64, i64, i64, ptr, ptr, ptr, ptr, i64 }
 %RM = type { i64, i64, ptr }
 %RS = type { i32, i32, i32, ptr, ptr }
+%rce = type { ptr, ptr, ptr, i64, i32, i64 }
 
 @j_error = external global ptr
 @rx_names = private constant [47 x i8] c"match\00test\00capture\00scan\00sub\00gsub\00splits\00split\00\00"
@@ -27,8 +28,13 @@
 @rx_propertybad = private constant [47 x i8] c"Regex failure: invalid character property name\00"
 @rx_refbad = private constant [35 x i8] c"Regex failure: undefined reference\00"
 @rx_zero = private constant [2 x i8] c"0\00"
+@rx_cache = private global [16 x %rce] zeroinitializer
+@rx_cache_budget = private global i64 262144
 
 declare ptr @j_alloc(i64)
+declare ptr @j_alloc_permanent(i64)
+declare void @j_arena_mark(ptr)
+declare void @j_arena_rewind(ptr)
 declare void @j_copy(ptr, ptr, i64)
 declare i64 @rx_capture_bytes(ptr)
 declare i64 @rx_max_width(ptr, i64, i32)
@@ -1028,6 +1034,9 @@ entry:
   %over = icmp ugt i64 %depth, 8192
   br i1 %over, label %resource, label %initialize
 initialize:
+  %runmark = alloca [3 x i64]
+  %runerr0 = load ptr, ptr @j_error
+  call void @j_arena_mark(ptr %runmark)
   %cursor = alloca ptr
   %position = alloca i64
   %choices = alloca ptr
@@ -1437,6 +1446,13 @@ finishkeep:
   store i64 %finalkeep, ptr %finalkeepp
   br label %done
 done:
+  %runerr1 = load ptr, ptr @j_error
+  %runclean = icmp eq ptr %runerr1, %runerr0
+  br i1 %runclean, label %rewindrun, label %retfinal
+rewindrun:
+  call void @j_arena_rewind(ptr %runmark)
+  br label %retfinal
+retfinal:
   ret i64 %finalend
 }
 
@@ -1675,6 +1691,520 @@ done:
   ret void
 }
 
+define internal ptr @rx_memo_find(ptr %memop, ptr %old) {
+entry:
+  %head = load ptr, ptr %memop
+  br label %loop
+loop:
+  %e = phi ptr [ %head, %entry ], [ %next, %step ]
+  %eend = icmp eq ptr %e, null
+  br i1 %eend, label %miss, label %check
+check:
+  %k = load ptr, ptr %e
+  %same = icmp eq ptr %k, %old
+  br i1 %same, label %hit, label %step
+hit:
+  %vp = getelementptr ptr, ptr %e, i64 1
+  %v = load ptr, ptr %vp
+  ret ptr %v
+step:
+  %np = getelementptr ptr, ptr %e, i64 2
+  %next = load ptr, ptr %np
+  br label %loop
+miss:
+  ret ptr null
+}
+
+; Structural pre-scan of a compiled program: returns true when every node can
+; be cloned into permanent memory. Counts nodes into %countp and uses a
+; memo for cycles, without allocating anything but transient memo entries.
+; Ops whose data field holds a %V string (14/25/26) are always banned; with
+; %strict set (compiled graphs) capture saves (5/6) are banned as well, since
+; they imply capture groups whose machinery must not be cached.
+define internal i1 @rx_cache_eligible(ptr %node, ptr %memop, ptr %countp, i32 %strict) {
+entry:
+  %empty = icmp eq ptr %node, null
+  br i1 %empty, label %yes, label %seen
+seen:
+  %found = call ptr @rx_memo_find(ptr %memop, ptr %node)
+  %dup = icmp ne ptr %found, null
+  br i1 %dup, label %yes, label %count
+count:
+  %n0 = load i64, ptr %countp
+  %n1 = add i64 %n0, 1
+  store i64 %n1, ptr %countp
+  %toomany = icmp ugt i64 %n1, 4096
+  br i1 %toomany, label %no, label %memoadd
+memoadd:
+  call void @rx_memo_add(ptr %memop, ptr %node, ptr %node)
+  %opp = getelementptr %RX, ptr %node, i32 0, i32 0
+  %op = load i32, ptr %opp
+  %ap = getelementptr %RX, ptr %node, i32 0, i32 4
+  %a = load ptr, ptr %ap
+  %bp = getelementptr %RX, ptr %node, i32 0, i32 5
+  %b = load ptr, ptr %bp
+  %dp = getelementptr %RX, ptr %node, i32 0, i32 6
+  %d = load ptr, ptr %dp
+  %isave = icmp eq i32 %op, 5
+  %issix = icmp eq i32 %op, 6
+  %isref = icmp eq i32 %op, 14
+  %issub = icmp eq i32 %op, 25
+  %iscond = icmp eq i32 %op, 26
+  %saved = icmp ne i32 %strict, 0
+  %saveish = or i1 %isave, %issix
+  %mustgo = or i1 %saveish, %isref
+  %banned0 = or i1 %mustgo, %issub
+  %banned1 = or i1 %banned0, %iscond
+  %banned = and i1 %banned1, %saved
+  br i1 %banned, label %no, label %leftok
+leftok:
+  %la = call i1 @rx_cache_eligible(ptr %a, ptr %memop, ptr %countp, i32 %strict)
+  br i1 %la, label %rightok, label %no
+rightok:
+  %lb = call i1 @rx_cache_eligible(ptr %b, ptr %memop, ptr %countp, i32 %strict)
+  br i1 %lb, label %datadispatch, label %no
+datadispatch:
+  %dnull = icmp eq ptr %d, null
+  br i1 %dnull, label %yes, label %dkind
+dkind:
+  %isset = icmp eq i32 %op, 3
+  %isexpr = icmp eq i32 %op, 27
+  %isregexcond = icmp eq i32 %op, 28
+  %exprish = or i1 %isexpr, %isregexcond
+  br i1 %isset, label %setdata, label %ddatacheck
+ddatacheck:
+  br i1 %exprish, label %graphdata, label %no
+setdata:
+  %ls = call i1 @rx_eligible_set(ptr %d, ptr %memop, ptr %countp)
+  br i1 %ls, label %yes, label %no
+graphdata:
+  %lg = call i1 @rx_cache_eligible(ptr %d, ptr %memop, ptr %countp, i32 %strict)
+  br i1 %lg, label %yes, label %no
+yes:
+  ret i1 true
+no:
+  ret i1 false
+}
+
+define internal i1 @rx_eligible_set(ptr %set, ptr %memop, ptr %countp) {
+entry:
+  %empty = icmp eq ptr %set, null
+  br i1 %empty, label %yes, label %seen
+seen:
+  %found = call ptr @rx_memo_find(ptr %memop, ptr %set)
+  %dup = icmp ne ptr %found, null
+  br i1 %dup, label %yes, label %count
+count:
+  %n0 = load i64, ptr %countp
+  %n1 = add i64 %n0, 1
+  store i64 %n1, ptr %countp
+  %toomany = icmp ugt i64 %n1, 4096
+  br i1 %toomany, label %no, label %memoadd
+memoadd:
+  call void @rx_memo_add(ptr %memop, ptr %set, ptr %set)
+  %kp = getelementptr %RS, ptr %set, i32 0, i32 0
+  %kind = load i32, ptr %kp
+  %ap = getelementptr %RS, ptr %set, i32 0, i32 3
+  %a = load ptr, ptr %ap
+  %bp = getelementptr %RS, ptr %set, i32 0, i32 4
+  %b = load ptr, ptr %bp
+  %known = icmp ult i32 %kind, 5
+  br i1 %known, label %leftok, label %no
+leftok:
+  %la = call i1 @rx_eligible_set(ptr %a, ptr %memop, ptr %countp)
+  br i1 %la, label %rightok, label %no
+rightok:
+  %lb = call i1 @rx_eligible_set(ptr %b, ptr %memop, ptr %countp)
+  br i1 %lb, label %yes, label %no
+yes:
+  ret i1 true
+no:
+  ret i1 false
+}
+
+define internal void @rx_memo_add(ptr %memop, ptr %old, ptr %new) {
+entry:
+  %e = call ptr @j_alloc(i64 24)
+  store ptr %old, ptr %e
+  %vp = getelementptr ptr, ptr %e, i64 1
+  store ptr %new, ptr %vp
+  %np = getelementptr ptr, ptr %e, i64 2
+  %head = load ptr, ptr %memop
+  store ptr %head, ptr %np
+  store ptr %e, ptr %memop
+  ret void
+}
+
+define internal i64 @rx_cache_hash(ptr %data, i64 %n, i32 %flags) {
+entry:
+  %f = zext i32 %flags to i64
+  %seed0 = mul i64 %f, -7046029254386353131
+  %seed = xor i64 %seed0, -3750763034362895579
+  br label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %next, %body ]
+  %h = phi i64 [ %seed, %entry ], [ %hn, %body ]
+  %more = icmp ult i64 %i, %n
+  br i1 %more, label %body, label %done
+body:
+  %p = getelementptr i8, ptr %data, i64 %i
+  %b = load i8, ptr %p
+  %b64 = zext i8 %b to i64
+  %x = xor i64 %h, %b64
+  %hn = mul i64 %x, 1099511628211
+  %next = add i64 %i, 1
+  br label %loop
+done:
+  %nz = or i64 %h, 1
+  ret i64 %nz
+}
+
+define internal i1 @rx_key_equal(ptr %a, ptr %b, i64 %n) {
+entry:
+  br label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %nx, %next ]
+  %more = icmp ult i64 %i, %n
+  br i1 %more, label %step, label %yes
+step:
+  %ap = getelementptr i8, ptr %a, i64 %i
+  %bp = getelementptr i8, ptr %b, i64 %i
+  %x = load i8, ptr %ap
+  %y = load i8, ptr %bp
+  %same = icmp eq i8 %x, %y
+  br i1 %same, label %next, label %no
+next:
+  %nx = add i64 %i, 1
+  br label %loop
+yes:
+  ret i1 true
+no:
+  ret i1 false
+}
+
+; Deep-clones an %RX node tree (AST or compiled graph) into permanent memory.
+; A linear memo handles cycles and diamonds. %strict selects the compiled-graph
+; rule set: ops 5/6 (capture saves), 14 (backreference), 25 (subroutine call)
+; and 26 (named conditional) may only carry %V strings, so a graph containing
+; them is ineligible for caching. Remaining data pointers are %RS class trees
+; (op 3) or nested %RX graphs (ops 27/28), which are clonable. The cloned
+; region contains no pointers into transient memory, so it is safe against
+; both arena rewinds and the copying collector.
+define internal ptr @rx_clone_node(ptr %node, ptr %memop, ptr %okp, ptr %countp, i32 %strict) {
+entry:
+  %empty = icmp eq ptr %node, null
+  br i1 %empty, label %passthrough, label %okcheck
+okcheck:
+  %ok0 = load i1, ptr %okp
+  br i1 %ok0, label %memolookup, label %passthrough
+passthrough:
+  ret ptr %node
+memolookup:
+  %found = call ptr @rx_memo_find(ptr %memop, ptr %node)
+  %hit = icmp ne ptr %found, null
+  br i1 %hit, label %hitout, label %fresh
+hitout:
+  ret ptr %found
+fresh:
+  %count = load i64, ptr %countp
+  %nextcount = add i64 %count, 1
+  store i64 %nextcount, ptr %countp
+  %toomany = icmp ugt i64 %nextcount, 4096
+  br i1 %toomany, label %toobig, label %alloc
+toobig:
+  store i1 false, ptr %okp
+  br label %passthrough
+alloc:
+  %clone = call ptr @j_alloc_permanent(i64 40)
+  call void @rx_memo_add(ptr %memop, ptr %node, ptr %clone)
+  %opp = getelementptr %RX, ptr %node, i32 0, i32 0
+  %op = load i32, ptr %opp
+  %vp = getelementptr %RX, ptr %node, i32 0, i32 1
+  %val = load i32, ptr %vp
+  %xp = getelementptr %RX, ptr %node, i32 0, i32 2
+  %x = load i32, ptr %xp
+  %yp = getelementptr %RX, ptr %node, i32 0, i32 3
+  %y = load i32, ptr %yp
+  %cap = getelementptr %RX, ptr %clone, i32 0, i32 0
+  store i32 %op, ptr %cap
+  %cvp = getelementptr %RX, ptr %clone, i32 0, i32 1
+  store i32 %val, ptr %cvp
+  %cxp = getelementptr %RX, ptr %clone, i32 0, i32 2
+  store i32 %x, ptr %cxp
+  %cyp = getelementptr %RX, ptr %clone, i32 0, i32 3
+  store i32 %y, ptr %cyp
+  %ap = getelementptr %RX, ptr %node, i32 0, i32 4
+  %a = load ptr, ptr %ap
+  %bp = getelementptr %RX, ptr %node, i32 0, i32 5
+  %b = load ptr, ptr %bp
+  %dp = getelementptr %RX, ptr %node, i32 0, i32 6
+  %d = load ptr, ptr %dp
+  %isave = icmp eq i32 %op, 5
+  %issix = icmp eq i32 %op, 6
+  %isref = icmp eq i32 %op, 14
+  %issub = icmp eq i32 %op, 25
+  %iscond = icmp eq i32 %op, 26
+  %saved = icmp ne i32 %strict, 0
+  %saveish = or i1 %isave, %issix
+  %mustgo = or i1 %saveish, %isref
+  %banned0 = or i1 %mustgo, %issub
+  %banned1 = or i1 %banned0, %iscond
+  %banned = and i1 %banned1, %saved
+  br i1 %banned, label %reject, label %children
+reject:
+  store i1 false, ptr %okp
+  br label %passthrough
+children:
+  %ca = call ptr @rx_clone_node(ptr %a, ptr %memop, ptr %okp, ptr %countp, i32 %strict)
+  %cb = call ptr @rx_clone_node(ptr %b, ptr %memop, ptr %okp, ptr %countp, i32 %strict)
+  br label %datadispatch
+datadispatch:
+  %dnull = icmp eq ptr %d, null
+  br i1 %dnull, label %putfields, label %dkind
+dkind:
+  %isset = icmp eq i32 %op, 3
+  %isexpr = icmp eq i32 %op, 27
+  %isregexcond = icmp eq i32 %op, 28
+  %exprish = or i1 %isexpr, %isregexcond
+  br i1 %isset, label %setdata, label %ddatacheck
+ddatacheck:
+  br i1 %exprish, label %graphdata, label %reject2
+setdata:
+  %setclone = call ptr @rx_clone_set(ptr %d, ptr %memop, ptr %okp, ptr %countp)
+  br label %putfields
+graphdata:
+  %graphclone = call ptr @rx_clone_node(ptr %d, ptr %memop, ptr %okp, ptr %countp, i32 %strict)
+  br label %putfields
+reject2:
+  store i1 false, ptr %okp
+  br label %putfields
+putfields:
+  %cdata = phi ptr [ null, %datadispatch ], [ %setclone, %setdata ], [ %graphclone, %graphdata ], [ null, %reject2 ]
+  %capf = getelementptr %RX, ptr %clone, i32 0, i32 4
+  %cbpf = getelementptr %RX, ptr %clone, i32 0, i32 5
+  %cdpf = getelementptr %RX, ptr %clone, i32 0, i32 6
+  store ptr %ca, ptr %capf
+  store ptr %cb, ptr %cbpf
+  store ptr %cdata, ptr %cdpf
+  ret ptr %clone
+}
+
+define internal ptr @rx_clone_set(ptr %set, ptr %memop, ptr %okp, ptr %countp) {
+entry:
+  %empty = icmp eq ptr %set, null
+  br i1 %empty, label %passthrough, label %okcheck
+okcheck:
+  %ok0 = load i1, ptr %okp
+  br i1 %ok0, label %memolookup, label %passthrough
+passthrough:
+  ret ptr %set
+memolookup:
+  %found = call ptr @rx_memo_find(ptr %memop, ptr %set)
+  %hit = icmp ne ptr %found, null
+  br i1 %hit, label %hitout, label %fresh
+hitout:
+  ret ptr %found
+fresh:
+  %count = load i64, ptr %countp
+  %nextcount = add i64 %count, 1
+  store i64 %nextcount, ptr %countp
+  %toomany = icmp ugt i64 %nextcount, 4096
+  br i1 %toomany, label %toobig, label %alloc
+toobig:
+  store i1 false, ptr %okp
+  br label %passthrough
+alloc:
+  %clone = call ptr @j_alloc_permanent(i64 32)
+  call void @rx_memo_add(ptr %memop, ptr %set, ptr %clone)
+  %kp = getelementptr %RS, ptr %set, i32 0, i32 0
+  %kind = load i32, ptr %kp
+  %lp = getelementptr %RS, ptr %set, i32 0, i32 1
+  %lo = load i32, ptr %lp
+  %hp = getelementptr %RS, ptr %set, i32 0, i32 2
+  %hi = load i32, ptr %hp
+  %ckp = getelementptr %RS, ptr %clone, i32 0, i32 0
+  %clp = getelementptr %RS, ptr %clone, i32 0, i32 1
+  %chp = getelementptr %RS, ptr %clone, i32 0, i32 2
+  store i32 %kind, ptr %ckp
+  store i32 %lo, ptr %clp
+  store i32 %hi, ptr %chp
+  %ap = getelementptr %RS, ptr %set, i32 0, i32 3
+  %a = load ptr, ptr %ap
+  %bp = getelementptr %RS, ptr %set, i32 0, i32 4
+  %b = load ptr, ptr %bp
+  %ca = call ptr @rx_clone_set(ptr %a, ptr %memop, ptr %okp, ptr %countp)
+  %cb = call ptr @rx_clone_set(ptr %b, ptr %memop, ptr %okp, ptr %countp)
+  %cap = getelementptr %RS, ptr %clone, i32 0, i32 3
+  %cbp = getelementptr %RS, ptr %clone, i32 0, i32 4
+  store ptr %ca, ptr %cap
+  store ptr %cb, ptr %cbp
+  ret ptr %clone
+}
+
+; Returns { anchor kind, first required literal }. Anchor kind: 0 none,
+; 1 the whole match is pinned to position 0 (\A, or ^ under the s flag),
+; 2 pinned to the search origin (\G). The literal is the first consumed
+; codepoint when it is exact (no i flag in effect at that point).
+define internal { i32, i32 } @rx_head_info(ptr %graph, i32 %flags) {
+entry:
+  br label %walk
+walk:
+  %node = phi ptr [ %graph, %entry ], [ %nopt, %opt ], [ %nstart, %start ], [ %ngs, %gs ]
+  %anchor = phi i32 [ 0, %entry ], [ %anchor, %opt ], [ %ancset, %start ], [ 2, %gs ]
+  %lit = phi i32 [ -1, %entry ], [ %lit, %opt ], [ -1, %start ], [ -1, %gs ]
+  %fl = phi i32 [ %flags, %entry ], [ %flnew, %opt ], [ %fl, %start ], [ %fl, %gs ]
+  %empty = icmp eq ptr %node, null
+  br i1 %empty, label %out, label %decide
+decide:
+  %op = load i32, ptr %node
+  %vp = getelementptr %RX, ptr %node, i32 0, i32 1
+  %val = load i32, ptr %vp
+  switch i32 %op, label %out [ i32 18, label %opt i32 8, label %start i32 21, label %gs i32 1, label %literal ]
+opt:
+  %flnew = add i32 %val, 0
+  %apo = getelementptr %RX, ptr %node, i32 0, i32 4
+  %nopt = load ptr, ptr %apo
+  br label %walk
+start:
+  %api = getelementptr %RX, ptr %node, i32 0, i32 4
+  %nstart = load ptr, ptr %api
+  %absolute = icmp ne i32 %val, 0
+  %sb = and i32 %fl, 8
+  %single = icmp ne i32 %sb, 0
+  %anchored = or i1 %absolute, %single
+  %ancset = select i1 %anchored, i32 1, i32 0
+  br label %walk
+gs:
+  %apg = getelementptr %RX, ptr %node, i32 0, i32 4
+  %ngs = load ptr, ptr %apg
+  br label %walk
+literal:
+  %ib = and i32 %fl, 1
+  %ci = icmp ne i32 %ib, 0
+  %litv = select i1 %ci, i32 -1, i32 %val
+  br label %out
+out:
+  %anchorout = phi i32 [ %anchor, %walk ], [ %anchor, %decide ], [ %anchor, %literal ]
+  %litout = phi i32 [ %lit, %walk ], [ -1, %decide ], [ %litv, %literal ]
+  %pair0 = insertvalue { i32, i32 } poison, i32 %anchorout, 0
+  %pair = insertvalue { i32, i32 } %pair0, i32 %litout, 1
+  ret { i32, i32 } %pair
+}
+
+define internal { ptr, ptr } @rx_cache_lookup(ptr %pattern, i32 %flags) {
+entry:
+  %n = call i64 @b_len(ptr %pattern)
+  %data = call ptr @b_data(ptr %pattern)
+  %h = call i64 @rx_cache_hash(ptr %data, i64 %n, i32 %flags)
+  %slotidx = and i64 %h, 15
+  %slotp = getelementptr [16 x %rce], ptr @rx_cache, i64 0, i64 %slotidx
+  %shashp = getelementptr %rce, ptr %slotp, i32 0, i32 5
+  %shash = load i64, ptr %shashp
+  %samehash = icmp eq i64 %shash, %h
+  br i1 %samehash, label %lencheck, label %miss
+lencheck:
+  %slnp = getelementptr %rce, ptr %slotp, i32 0, i32 3
+  %sln = load i64, ptr %slnp
+  %samelength = icmp eq i64 %sln, %n
+  br i1 %samelength, label %flagscheck, label %miss
+flagscheck:
+  %sflp = getelementptr %rce, ptr %slotp, i32 0, i32 4
+  %sfl = load i32, ptr %sflp
+  %sameflags = icmp eq i32 %sfl, %flags
+  br i1 %sameflags, label %keys, label %miss
+keys:
+  %sdp = getelementptr %rce, ptr %slotp, i32 0, i32 2
+  %sd = load ptr, ptr %sdp
+  %equal = call i1 @rx_key_equal(ptr %sd, ptr %data, i64 %n)
+  br i1 %equal, label %hit, label %miss
+hit:
+  %gp = getelementptr %rce, ptr %slotp, i32 0, i32 0
+  %ap = getelementptr %rce, ptr %slotp, i32 0, i32 1
+  %g = load ptr, ptr %gp
+  %a = load ptr, ptr %ap
+  %pair0 = insertvalue { ptr, ptr } poison, ptr %a, 0
+  %pair = insertvalue { ptr, ptr } %pair0, ptr %g, 1
+  ret { ptr, ptr } %pair
+miss:
+  %nullpair0 = insertvalue { ptr, ptr } poison, ptr null, 0
+  %nullpair = insertvalue { ptr, ptr } %nullpair0, ptr null, 1
+  ret { ptr, ptr } %nullpair
+}
+
+; Publishes a compiled program in the permanent-heap cache. The key is the
+; pattern bytes plus the effective flags; the payload is a deep clone of the
+; AST and of the compiled graph, allocated with j_alloc_permanent so that
+; neither j_arena_rewind nor a copying collection can invalidate it.
+define internal void @rx_cache_fill(ptr %pattern, i32 %flags, ptr %tree, ptr %graph) {
+entry:
+  %okp = alloca i1
+  %memop = alloca ptr
+  %countp = alloca i64
+  store i1 true, ptr %okp
+  store ptr null, ptr %memop
+  store i64 0, ptr %countp
+  %n = call i64 @b_len(ptr %pattern)
+  %small = icmp ule i64 %n, 256
+  br i1 %small, label %budget, label %out
+budget:
+  %left = load i64, ptr @rx_cache_budget
+  %funded = icmp sgt i64 %left, 0
+  br i1 %funded, label %scantree, label %out
+scantree:
+  %treeok = call i1 @rx_cache_eligible(ptr %tree, ptr %memop, ptr %countp, i32 0)
+  br i1 %treeok, label %scangraph, label %out
+scangraph:
+  store ptr null, ptr %memop
+  store i64 0, ptr %countp
+  %graphok = call i1 @rx_cache_eligible(ptr %graph, ptr %memop, ptr %countp, i32 1)
+  br i1 %graphok, label %charge, label %out
+charge:
+  %nodes = load i64, ptr %countp
+  %nodb = mul i64 %nodes, 72
+  %cost = add i64 %nodb, %n
+  %costwide = add i64 %cost, 64
+  %left2 = load i64, ptr @rx_cache_budget
+  %afford = icmp uge i64 %left2, %costwide
+  br i1 %afford, label %deduct, label %out
+deduct:
+  %remaining = sub i64 %left2, %costwide
+  store i64 %remaining, ptr @rx_cache_budget
+  store ptr null, ptr %memop
+  store i64 0, ptr %countp
+  br label %clonetree
+clonetree:
+  %ast = call ptr @rx_clone_node(ptr %tree, ptr %memop, ptr %okp, ptr %countp, i32 0)
+  br label %clonegraph
+clonegraph:
+  store ptr null, ptr %memop
+  store i64 0, ptr %countp
+  store i1 true, ptr %okp
+  %cgraph = call ptr @rx_clone_node(ptr %graph, ptr %memop, ptr %okp, ptr %countp, i32 1)
+  br label %publish
+publish:
+  %data = call ptr @b_data(ptr %pattern)
+  %kbytes = call ptr @j_alloc_permanent(i64 %n)
+  call void @llvm.memcpy.p0.p0.i64(ptr %kbytes, ptr %data, i64 %n, i1 false)
+  %h = call i64 @rx_cache_hash(ptr %data, i64 %n, i32 %flags)
+  %slotidx = and i64 %h, 15
+  %slotp = getelementptr [16 x %rce], ptr @rx_cache, i64 0, i64 %slotidx
+  %gp = getelementptr %rce, ptr %slotp, i32 0, i32 0
+  store ptr %cgraph, ptr %gp
+  %asp = getelementptr %rce, ptr %slotp, i32 0, i32 1
+  store ptr %ast, ptr %asp
+  %kbp = getelementptr %rce, ptr %slotp, i32 0, i32 2
+  store ptr %kbytes, ptr %kbp
+  %nlp = getelementptr %rce, ptr %slotp, i32 0, i32 3
+  store i64 %n, ptr %nlp
+  %fpp = getelementptr %rce, ptr %slotp, i32 0, i32 4
+  store i32 %flags, ptr %fpp
+  %hp = getelementptr %rce, ptr %slotp, i32 0, i32 5
+  store i64 %h, ptr %hp
+  ret void
+out:
+  ret void
+}
+
 define internal ptr @rx_matches(ptr %pattern, ptr %ctx) {
 entry:
   %out = call ptr @j_array()
@@ -1685,6 +2215,22 @@ badtype:
   call void @j_fail(ptr @rx_stringbad)
   ret ptr %out
 compile:
+  %precfp = getelementptr %RC, ptr %ctx, i32 0, i32 4
+  %precflags = load i32, ptr %precfp
+  %cached = call { ptr, ptr } @rx_cache_lookup(ptr %pattern, i32 %precflags)
+  %cachedast = extractvalue { ptr, ptr } %cached, 0
+  %cachedgraph = extractvalue { ptr, ptr } %cached, 1
+  %cachedhit = icmp ne ptr %cachedgraph, null
+  br i1 %cachedhit, label %cachehit, label %setup
+cachehit:
+  %zeroed = getelementptr %RC, ptr %ctx, i32 0, i32 5
+  store i32 0, ptr %zeroed
+  %nonames = getelementptr %RC, ptr %ctx, i32 0, i32 6
+  store ptr null, ptr %nonames
+  %nographs = getelementptr %RC, ptr %ctx, i32 0, i32 12
+  store ptr null, ptr %nographs
+  br label %programready
+setup:
   %pd = call ptr @b_data(ptr %pattern)
   %pn = call i64 @b_len(ptr %pattern)
   %p = call ptr @j_alloc(i64 40)
@@ -1721,29 +2267,44 @@ ready:
   call void @rx_validate(ptr %tree, ptr %ctx)
   %validationerror = load ptr, ptr @j_error
   %compilevalid = icmp eq ptr %validationerror, null
-  br i1 %compilevalid, label %programready, label %done
-programready:
-  %boundsafe = call i1 @rx_search_bound_safe(ptr %tree)
+  br i1 %compilevalid, label %freshcompile, label %done
+freshcompile:
   %graph = call ptr @rx_compile(ptr %tree, ptr null)
   call void @rx_compile_calls(ptr %tree, ptr %ctx)
-  %count64 = zext i32 %count to i64
+  call void @rx_cache_fill(ptr %pattern, i32 %flags, ptr %tree, ptr %graph)
+  br label %programready
+programready:
+  %treeselected = phi ptr [ %tree, %freshcompile ], [ %cachedast, %cachehit ]
+  %graphselected = phi ptr [ %graph, %freshcompile ], [ %cachedgraph, %cachehit ]
+  %countselected = phi i32 [ %count, %freshcompile ], [ 0, %cachehit ]
+  %flagsselected = phi i32 [ %flags, %freshcompile ], [ %precflags, %cachehit ]
+  %boundsafe = call i1 @rx_search_bound_safe(ptr %treeselected)
+  %count64 = zext i32 %countselected to i64
   %slots = mul i64 %count64, 2
   %capbytes = mul i64 %slots, 8
-  %gbit = and i32 %flags, 16
+  %gbit = and i32 %flagsselected, 16
   %global = icmp ne i32 %gbit, 0
-  %lbit = and i32 %flags, 64
+  %lbit = and i32 %flagsselected, 64
   %longest = icmp ne i32 %lbit, 0
   %np = getelementptr %RC, ptr %ctx, i32 0, i32 3
   %n = load i64, ptr %np
   %originp = getelementptr %RC, ptr %ctx, i32 0, i32 7
-  %maximumwidth = call i64 @rx_max_width(ptr %tree, i64 %n, i32 %flags)
+  %maximumwidth = call i64 @rx_max_width(ptr %treeselected, i64 %n, i32 %flagsselected)
   %keepp = getelementptr %RC, ptr %ctx, i32 0, i32 8
   %visitedp = getelementptr %RC, ptr %ctx, i32 0, i32 10
   %graphp = getelementptr %RC, ptr %ctx, i32 0, i32 11
-  store ptr %graph, ptr %graphp
+  store ptr %graphselected, ptr %graphp
   %beststartp = alloca i64
   %bestendp = alloca i64
   %bestcapsp = alloca ptr
+  %headpair = call { i32, i32 } @rx_head_info(ptr %graphselected, i32 %flagsselected)
+  %anchor = extractvalue { i32, i32 } %headpair, 0
+  %firstlit = extractvalue { i32, i32 } %headpair, 1
+  %anchored0 = icmp eq i32 %anchor, 1
+  %anchoredG = icmp eq i32 %anchor, 2
+  %haslit = icmp sge i32 %firstlit, 0
+  %cspark = getelementptr %RC, ptr %ctx, i32 0, i32 1
+  %cps = load ptr, ptr %cspark
   br label %segment
 segment:
   %origin = phi i64 [0, %programready], [%aftermatch, %matchednext]
@@ -1755,7 +2316,25 @@ segment:
 search:
   %pos = phi i64 [%origin, %segment], [%nextpos, %advance]
   %finished = icmp ugt i64 %pos, %n
-  br i1 %finished, label %searchdone, label %newcaps
+  br i1 %finished, label %searchdone, label %fastcheck
+fastcheck:
+  %beyond0 = icmp ne i64 %pos, 0
+  %skip0 = and i1 %anchored0, %beyond0
+  br i1 %skip0, label %searchdone, label %fastG
+fastG:
+  %beyondG = icmp ne i64 %pos, %origin
+  %skipG = and i1 %anchoredG, %beyondG
+  br i1 %skipG, label %searchdone, label %fastlitcheck
+fastlitcheck:
+  br i1 %haslit, label %fastlit, label %newcaps
+fastlit:
+  %atlast = icmp uge i64 %pos, %n
+  br i1 %atlast, label %advance, label %litload
+litload:
+  %litaddr = getelementptr i32, ptr %cps, i64 %pos
+  %litc = load i32, ptr %litaddr
+  %litne = icmp ne i32 %litc, %firstlit
+  br i1 %litne, label %advance, label %newcaps
 newcaps:
   %caps = call ptr @j_alloc(i64 %capbytes)
   br label %init
@@ -1771,7 +2350,7 @@ initone:
 match:
   store i64 %pos, ptr %keepp
   store ptr null, ptr %visitedp
-  %end = call i64 @rx_run(ptr %graph, ptr %ctx, i64 %pos, ptr %caps, i64 0)
+  %end = call i64 @rx_run(ptr %graphselected, ptr %ctx, i64 %pos, ptr %caps, i64 0)
   %keep = load i64, ptr %keepp
   %pending = load ptr, ptr @j_error
   %failed = icmp ne ptr %pending, null

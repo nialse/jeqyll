@@ -22,6 +22,7 @@ declare ptr @j_at(ptr, i64)
 declare ptr @j_get(ptr, ptr)
 declare ptr @j_clone(ptr)
 declare i32 @j_cmp(ptr, ptr)
+declare i1 @j_str_eq(ptr, ptr)
 declare void @j_fail(ptr)
 declare ptr @t_explode(ptr)
 declare ptr @t_implode(ptr)
@@ -256,6 +257,16 @@ inner:
 matchbody:
   %path = call ptr @j_at(ptr %paths, i64 %j)
   %pathkey = call ptr @j_at(ptr %path, i64 %level)
+  %pktag = load i32, ptr %pathkey
+  %keytag = load i32, ptr %key
+  %pkeq = icmp eq i32 %pktag, 4
+  %keyeq = icmp eq i32 %keytag, 4
+  %bothstr = and i1 %pkeq, %keyeq
+  br i1 %bothstr, label %pdstreq, label %pdgen
+pdstreq:
+  %sameword = call i1 @j_str_eq(ptr %key, ptr %pathkey)
+  br i1 %sameword, label %matchput, label %matchadvance
+pdgen:
   %cmp = call i32 @j_cmp(ptr %key, ptr %pathkey)
   %match = icmp eq i32 %cmp, 0
   br i1 %match, label %matchput, label %matchadvance
