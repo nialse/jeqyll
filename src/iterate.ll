@@ -17,6 +17,24 @@
 @g_next_depth = internal global i64 0
 @g_keyerror = private constant [33 x i8] c"Cannot use non-string object key\00"
 @g_generators = private constant [130 x i8] c"select\00range\00recurse\00recurse_down\00while\00until\00repeat\00first\00last\00nth\00limit\00skip\00isempty\00inputs\00any\00all\00fromstream\00truncate_stream\00\00"
+
+; --- fast generator dispatch ---
+; @ev_g_blob is a byte-exact copy of @g_generators above and @ev_g_ids a
+; precomputed FNV-1a open-addressing table (linear probing) mapping name hash
+; to the generator id, verified against the blob string on probe hit. Misses
+; and collisions fall back to the original b_find switch path, so behavior
+; cannot differ. The probe helper itself is @ev_name_id in eval.ll.
+@ev_g_blob = private constant [130 x i8] c"select\00range\00recurse\00recurse_down\00while\00until\00repeat\00first\00last\00nth\00limit\00skip\00isempty\00inputs\00any\00all\00fromstream\00truncate_stream\00\00"
+@ev_g_offs = private constant [18 x i32] [
+  i32 0, i32 7, i32 13, i32 21, i32 34, i32 40, i32 46, i32 53, i32 59, i32 64, i32 68, i32 74, i32 79, i32 87, i32 94, i32 98,
+  i32 102, i32 113
+]
+@ev_g_ids = private constant [64 x i32] [
+  i32 -1, i32 7, i32 2, i32 11, i32 15, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 14, i32 4, i32 5,
+  i32 -1, i32 -1, i32 1, i32 -1, i32 -1, i32 9, i32 -1, i32 -1, i32 13, i32 8, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1,
+  i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 17, i32 -1, i32 6, i32 -1, i32 -1, i32 0, i32 -1, i32 -1,
+  i32 -1, i32 -1, i32 -1, i32 3, i32 10, i32 16, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 -1, i32 12, i32 -1
+]
 @g_range_error = private constant [29 x i8] c"Range bounds must be numeric\00"
 @g_limit_error = private constant [37 x i8] c"limit doesn't support negative count\00"
 @g_skip_error = private constant [36 x i8] c"skip doesn't support negative count\00"
@@ -58,6 +76,8 @@ declare ptr @ev_patternnull(ptr, ptr)
 declare ptr @ev_importenv(ptr, ptr, ptr)
 declare void @ev_itererror(ptr)
 declare ptr @ev_slice(ptr, ptr, ptr)
+declare ptr @ev_lookup1or2(ptr, ptr, i64, ptr)
+declare i32 @ev_name_id(ptr, ptr, ptr, ptr, i32)
 declare i64 @b_len(ptr)
 declare ptr @b_data(ptr)
 declare i32 @b_find(ptr, ptr)
@@ -570,6 +590,7 @@ entry:
   %currentcont = alloca ptr
   %currenthandler = alloca ptr
   %fzstatus = alloca i32
+  %gkindslot = alloca i32
   store ptr null, ptr %currenthandler
   %priorerror = load ptr, ptr @j_error
   %priorbreak = load ptr, ptr @ev_break_name
@@ -1170,31 +1191,31 @@ call:
   %privatebuiltin = icmp sle i32 %op, -2
   br i1 %privatebuiltin, label %generatorlookup, label %userlookup
 userlookup:
-  %function = call ptr @ev_lookup(ptr %env, ptr %a, i32 1, i64 %arity)
-  %foundfunction = icmp ne ptr %function, null
-  br i1 %foundfunction, label %usercall, label %filterlookup
+  %gkind = call ptr @ev_lookup1or2(ptr %env, ptr %a, i64 %arity, ptr %gkindslot)
+  %gk = load i32, ptr %gkindslot
+  %gkfunc = icmp eq i32 %gk, 1
+  br i1 %gkfunc, label %usercall, label %gkflcheck
+gkflcheck:
+  %gkfilter = icmp eq i32 %gk, 2
+  br i1 %gkfilter, label %filtercall, label %generatorlookup
 usercall:
-  %bodyp = getelementptr %GE, ptr %function, i32 0, i32 2
+  %bodyp = getelementptr %GE, ptr %gkind, i32 0, i32 2
   %body = load ptr, ptr %bodyp
-  %paramsp = getelementptr %GE, ptr %function, i32 0, i32 4
+  %paramsp = getelementptr %GE, ptr %gkind, i32 0, i32 4
   %params = load ptr, ptr %paramsp
-  %capturep = getelementptr %GE, ptr %function, i32 0, i32 5
+  %capturep = getelementptr %GE, ptr %gkind, i32 0, i32 5
   %capture = load ptr, ptr %capturep
   call void @g_callargs(ptr %iterator, ptr %body, ptr %params, ptr %b, i64 0, ptr %input, ptr %env, ptr %capture, ptr %continuation, ptr %handler)
   br label %loop
-filterlookup:
-  %filter = call ptr @ev_lookup(ptr %env, ptr %a, i32 2, i64 0)
-  %foundfilter = icmp ne ptr %filter, null
-  br i1 %foundfilter, label %filtercall, label %generatorlookup
 filtercall:
-  %filterbodyp = getelementptr %GE, ptr %filter, i32 0, i32 2
+  %filterbodyp = getelementptr %GE, ptr %gkind, i32 0, i32 2
   %filterbody = load ptr, ptr %filterbodyp
-  %filterenvp = getelementptr %GE, ptr %filter, i32 0, i32 5
+  %filterenvp = getelementptr %GE, ptr %gkind, i32 0, i32 5
   %filterenv = load ptr, ptr %filterenvp
   call void @g_schedule(ptr %iterator, ptr %filterbody, ptr %input, ptr %filterenv, ptr %continuation, ptr %handler)
   br label %loop
 generatorlookup:
-  %gid = call i32 @b_find(ptr %a, ptr @g_generators)
+  %gid = call i32 @ev_name_id(ptr %a, ptr @ev_g_blob, ptr @ev_g_offs, ptr @ev_g_ids, i32 64)
   switch i32 %gid, label %nativecall [ i32 0, label %selectcall i32 1, label %rangecall i32 2, label %recursecall i32 3, label %recursecall i32 4, label %whilecall i32 5, label %whilecall i32 6, label %repeatcall i32 7, label %consumecall i32 8, label %consumecall i32 9, label %quotacall i32 10, label %quotacall i32 11, label %quotacall i32 12, label %consumecall i32 13, label %inputscall i32 14, label %anyallcall i32 15, label %anyallcall i32 16, label %fromstreamcall i32 17, label %truncatecall ]
 nativecall:
   %iszeroarg = icmp eq i64 %arity, 0
