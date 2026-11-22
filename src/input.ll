@@ -44,6 +44,7 @@
 @in_top_array = private constant [31 x i8] c"Unmatched ']' at the top-level\00"
 @in_top_object = private constant [31 x i8] c"Unmatched '}' at the top-level\00"
 @in_depth = private constant [33 x i8] c"Exceeds depth limit for parsing\00\00"
+@ptstops = private constant [32 x i8] c"\00&\00\00\05\10\00\04\00\00\00(\00\00\00(\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00"
 
 declare ptr @j_alloc_permanent(i64)
 declare ptr @j_null()
@@ -492,10 +493,117 @@ entry:
   %cp = getelementptr %Input, ptr %reader, i32 0, i32 9
   %startline = load i64, ptr %lp
   %startcolumn = load i64, ptr %cp
+  %ptoff = alloca i64
+  %ptcole = alloca ptr
+  %ptclm = alloca ptr
+  %ptclo = alloca i64
+  %ptclef = alloca i1
+  %ptclep = alloca ptr
   %first = call i32 @in_peek(ptr %reader)
   %quoted = icmp eq i32 %first, 34
   %sequence = call i1 @in_flag(ptr %reader, i32 512)
-  br i1 %quoted, label %quoteopen, label %plain
+  br i1 %quoted, label %quoteopen, label %ptopen
+ptopen:
+  %ptfine = icmp sge i32 %first, 0
+  br i1 %ptfine, label %ptgo, label %plain
+ptgo:
+  %ptposp = getelementptr %Input, ptr %reader, i32 0, i32 6
+  %ptendp = getelementptr %Input, ptr %reader, i32 0, i32 7
+  %ptbufp = getelementptr %Input, ptr %reader, i32 0, i32 5
+  %ptpos0 = load i64, ptr %ptposp
+  %ptend = load i64, ptr %ptendp
+  %ptbuf = load ptr, ptr %ptbufp
+  br label %ptscan
+ptscan:
+  %ptx = phi i64 [ %ptpos0, %ptgo ], [ %ptxn, %ptadv ]
+  %pthave = icmp ult i64 %ptx, %ptend
+  br i1 %pthave, label %ptbyte, label %ptback
+ptbyte:
+  %ptq = getelementptr i8, ptr %ptbuf, i64 %ptx
+  %ptb = load i8, ptr %ptq
+  %ptgrp = lshr i8 %ptb, 3
+  %ptgrpw = zext i8 %ptgrp to i64
+  %ptrowp = getelementptr [32 x i8], ptr @ptstops, i64 0, i64 %ptgrpw
+  %ptrow = load i8, ptr %ptrowp
+  %ptbitn = and i8 %ptb, 7
+  %ptmask = shl i8 1, %ptbitn
+  %pthit = and i8 %ptrow, %ptmask
+  %ptboundary = icmp ne i8 %pthit, 0
+  %ptisrs = icmp eq i8 %ptb, 30
+  %ptseqrs = and i1 %sequence, %ptisrs
+  %ptstop = or i1 %ptboundary, %ptseqrs
+  br i1 %ptstop, label %ptfin, label %ptadv
+ptadv:
+  %ptxn = add i64 %ptx, 1
+  br label %ptscan
+ptback:
+  br label %plain
+ptfin:
+  %ptlen = sub i64 %ptx, %ptpos0
+  %ptlenok = icmp ugt i64 %ptlen, 0
+  br i1 %ptlenok, label %ptparse, label %ptback
+ptparse:
+  %ptLb = add i64 %ptlen, 1
+  %ptL = select i1 %ptseqrs, i64 %ptlen, i64 %ptLb
+  %ptole0 = load ptr, ptr @j_error
+  store ptr %ptole0, ptr %ptcole
+  %ptlm0 = load ptr, ptr @j_parse_error_message
+  store ptr %ptlm0, ptr %ptclm
+  %ptlo0 = load i64, ptr @j_parse_error_offset
+  store i64 %ptlo0, ptr %ptclo
+  %ptlef0 = load i1, ptr @j_parse_error_eof
+  store i1 %ptlef0, ptr %ptclef
+  %ptlep0 = load ptr, ptr @j_parse_error_path
+  store ptr %ptlep0, ptr %ptclep
+  %ptslice = getelementptr i8, ptr %ptbuf, i64 %ptpos0
+  store i64 0, ptr %ptoff
+  %ptval = call ptr @j_parse(ptr %ptslice, i64 %ptL, ptr %ptoff)
+  %ptok = icmp ne ptr %ptval, null
+  br i1 %ptok, label %ptusedcheck, label %ptbad
+ptusedcheck:
+  %ptused = load i64, ptr %ptoff
+  %ptusedok = icmp eq i64 %ptused, %ptlen
+  br i1 %ptusedok, label %ptrootcheck, label %ptbad
+ptrootcheck:
+  %ptdrootp = getelementptr %Input, ptr %reader, i32 0, i32 21
+  %ptdroot = load i64, ptr %ptdrootp
+  %ptd0 = icmp eq i64 %ptdroot, 0
+  %ptdcomma = icmp eq i8 %ptb, 44
+  %ptdcolon = icmp eq i8 %ptb, 58
+  %ptdarr = icmp eq i8 %ptb, 93
+  %ptdobj = icmp eq i8 %ptb, 125
+  %ptda = or i1 %ptdcomma, %ptdcolon
+  %ptdb = or i1 %ptdarr, %ptdobj
+  %ptdstruct = or i1 %ptda, %ptdb
+  %ptrootbad = and i1 %ptd0, %ptdstruct
+  br i1 %ptrootbad, label %ptbad, label %ptambig
+ptambig:
+  br i1 %sequence, label %ptambseq, label %ptaccept
+ptambseq:
+  %pttag = load i32, ptr %ptval
+  %ptisnum = icmp eq i32 %pttag, 3
+  %ptambcond = and i1 %ptisrs, %ptisnum
+  br i1 %ptambcond, label %ptbad, label %ptaccept
+ptaccept:
+  %ptnpos = add i64 %ptpos0, %ptlen
+  store i64 %ptnpos, ptr %ptposp
+  %ptcolp = getelementptr %Input, ptr %reader, i32 0, i32 9
+  %ptcolv = load i64, ptr %ptcolp
+  %ptcoln = add i64 %ptcolv, %ptlen
+  store i64 %ptcoln, ptr %ptcolp
+  ret ptr %ptval
+ptbad:
+  %ptle1 = load ptr, ptr %ptcole
+  store ptr %ptle1, ptr @j_error
+  %ptlm1 = load ptr, ptr %ptclm
+  store ptr %ptlm1, ptr @j_parse_error_message
+  %ptlo1 = load i64, ptr %ptclo
+  store i64 %ptlo1, ptr @j_parse_error_offset
+  %ptlef1 = load i1, ptr %ptclef
+  store i1 %ptlef1, ptr @j_parse_error_eof
+  %ptlep1 = load ptr, ptr %ptclep
+  store ptr %ptlep1, ptr @j_parse_error_path
+  br label %ptback
 quoteopen:
   call void @in_take(ptr %reader, i32 34)
   %qposp = getelementptr %Input, ptr %reader, i32 0, i32 6
@@ -562,7 +670,7 @@ stringend:
   %sio = icmp eq i32 %sc, -2
   br i1 %sio, label %failure, label %parse
 plain:
-  %plen = phi i64 [ 0, %entry ], [ %nextplen, %plainbyte ]
+  %plen = phi i64 [ 0, %ptopen ], [ %nextplen, %plainbyte ], [ 0, %ptback ]
   %pc = call i32 @in_peek(ptr %reader)
   %boundary = call i1 @in_boundary(i32 %pc)
   %prs = icmp eq i32 %pc, 30
@@ -1090,6 +1198,74 @@ spacecheck:
   %whitespace = call i1 @in_white(i32 %c)
   br i1 %whitespace, label %skip, label %recordcheck
 skip:
+  %skposp = getelementptr %Input, ptr %reader, i32 0, i32 6
+  %skendp = getelementptr %Input, ptr %reader, i32 0, i32 7
+  %skbufp = getelementptr %Input, ptr %reader, i32 0, i32 5
+  %skpos0 = load i64, ptr %skposp
+  %skendv = load i64, ptr %skendp
+  %skbufv = load ptr, ptr %skbufp
+  br label %skscan
+skscan:
+  %ski = phi i64 [ %skpos0, %skip ], [ %skn, %skadv ]
+  %sknl = phi i64 [ 0, %skip ], [ %sknln, %skadv ]
+  %sklast = phi i64 [ 0, %skip ], [ %sklastn, %skadv ]
+  %skhave = icmp ult i64 %ski, %skendv
+  br i1 %skhave, label %skbyte, label %skcendall
+skbyte:
+  %skq = getelementptr i8, ptr %skbufv, i64 %ski
+  %skb = load i8, ptr %skq
+  %skn = add i64 %ski, 1
+  %skb10 = icmp eq i8 %skb, 10
+  br i1 %skb10, label %skc1, label %skc2
+skc1:
+  %sknl1 = add i64 %sknl, 1
+  br label %skadv
+skc2:
+  %sksp = icmp eq i8 %skb, 32
+  %sktab = icmp eq i8 %skb, 9
+  %skcr = icmp eq i8 %skb, 13
+  %skwsa = or i1 %sksp, %sktab
+  %skws = or i1 %skwsa, %skcr
+  br i1 %skws, label %skadv, label %skcend
+skadv:
+  %sknln = phi i64 [ %sknl1, %skc1 ], [ %sknl, %skc2 ]
+  %sklastn = phi i64 [ %ski, %skc1 ], [ %sklast, %skc2 ]
+  br label %skscan
+skcend:
+  %skpf1 = phi i64 [ %ski, %skc2 ]
+  store i64 %skpf1, ptr %skposp
+  %sklinep = getelementptr %Input, ptr %reader, i32 0, i32 8
+  %sklinev = load i64, ptr %sklinep
+  %sklinen = add i64 %sklinev, %sknl
+  store i64 %sklinen, ptr %sklinep
+  %skcolp = getelementptr %Input, ptr %reader, i32 0, i32 9
+  %skcolv = load i64, ptr %skcolp
+  %sknl2 = icmp ne i64 %sknl, 0
+  %skcolnl = sub i64 %skpf1, %sklast
+  %skcolnl2 = sub i64 %skcolnl, 1
+  %skcolrun = sub i64 %skpf1, %skpos0
+  %skcolplain = add i64 %skcolv, %skcolrun
+  %skcoln = select i1 %sknl2, i64 %skcolnl2, i64 %skcolplain
+  store i64 %skcoln, ptr %skcolp
+  br label %loop
+skcendall:
+  %skpf2 = add i64 %skendv, 0
+  store i64 %skpf2, ptr %skposp
+  %sklinep2 = getelementptr %Input, ptr %reader, i32 0, i32 8
+  %sklinev2 = load i64, ptr %sklinep2
+  %sklinen2 = add i64 %sklinev2, %sknl
+  store i64 %sklinen2, ptr %sklinep2
+  %skcolp2 = getelementptr %Input, ptr %reader, i32 0, i32 9
+  %skcolv2 = load i64, ptr %skcolp2
+  %sknl3 = icmp ne i64 %sknl, 0
+  %skcolnl3 = sub i64 %skendv, %sklast
+  %skcolnl4 = sub i64 %skcolnl3, 1
+  %skcolrun3 = sub i64 %skendv, %skpos0
+  %skcolplain2 = add i64 %skcolv2, %skcolrun3
+  %skcoln2 = select i1 %sknl3, i64 %skcolnl4, i64 %skcolplain2
+  store i64 %skcoln2, ptr %skcolp2
+  br label %loop
+skipone:
   call void @in_take(ptr %reader, i32 %c)
   br label %loop
 recordcheck:
@@ -1098,7 +1274,7 @@ recordcheck:
   br i1 %recordsep, label %record, label %statecheck
 record:
   %inside = icmp ne i64 %depth, 0
-  br i1 %inside, label %problem, label %skip
+  br i1 %inside, label %problem, label %skipone
 statecheck:
   %top = icmp eq i64 %depth, 0
   %ndnoseq = xor i1 %sequence, true
