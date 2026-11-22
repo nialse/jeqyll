@@ -577,13 +577,40 @@ error:
   ret ptr %old
 }
 
+; Copy a %V header, moving single-allocation strings (data == old + 48) with
+; their inline bytes in one j_gc_copy call.
+define internal ptr @j_gc_obj(ptr %old, ptr %isnew) {
+entry:
+  %isnull = icmp eq ptr %old, null
+  br i1 %isnull, label %plain, label %checktag
+checktag:
+  %tag = load i32, ptr %old
+  %isstring = icmp eq i32 %tag, 4
+  br i1 %isstring, label %string, label %plain
+string:
+  %dp = getelementptr %V, ptr %old, i32 0, i32 5
+  %data = load ptr, ptr %dp
+  %inlinep = getelementptr i8, ptr %old, i64 48
+  %isinline = icmp eq ptr %data, %inlinep
+  br i1 %isinline, label %sized, label %plain
+sized:
+  %lp = getelementptr %V, ptr %old, i32 0, i32 3
+  %length = load i64, ptr %lp
+  %total = add i64 %length, 49
+  %copy = call ptr @j_gc_copy(ptr %old, i64 %total, ptr %isnew)
+  ret ptr %copy
+plain:
+  %plaincopy = call ptr @j_gc_copy(ptr %old, i64 48, ptr %isnew)
+  ret ptr %plaincopy
+}
+
 ; This work queue handles arbitrary JSON graph depth without native recursion.
 ; Forwarding is installed before enqueueing, so shared and cyclic graphs are
 ; processed only once even when callers construct internal cyclic values.
 define ptr @j_gc_value(ptr %value) {
 entry:
   %isnew = alloca i1
-  %root = call ptr @j_gc_copy(ptr %value, i64 48, ptr %isnew)
+  %root = call ptr @j_gc_obj(ptr %value, ptr %isnew)
   %fresh = load i1, ptr %isnew
   br i1 %fresh, label %begin, label %done
 begin:
@@ -620,10 +647,20 @@ string:
   %stringdatap = getelementptr %V, ptr %old, i32 0, i32 5
   %stringlength = load i64, ptr %stringlengthp
   %stringdata = load ptr, ptr %stringdatap
+  %inlinep = getelementptr i8, ptr %old, i64 48
+  %isinline = icmp eq ptr %stringdata, %inlinep
+  br i1 %isinline, label %stringinline, label %stringsplit
+stringinline:
+  %inlinedata = getelementptr i8, ptr %new, i64 48
+  br label %stringstore
+stringsplit:
   %stringbytes = add i64 %stringlength, 1
   %newstringdata = call ptr @j_gc_copy(ptr %stringdata, i64 %stringbytes, ptr %isnew)
+  br label %stringstore
+stringstore:
+  %finaldata = phi ptr [ %inlinedata, %stringinline ], [ %newstringdata, %stringsplit ]
   %newstringdatap = getelementptr %V, ptr %new, i32 0, i32 5
-  store ptr %newstringdata, ptr %newstringdatap
+  store ptr %finaldata, ptr %newstringdatap
   br label %advance
 container:
   %lengthp = getelementptr %V, ptr %old, i32 0, i32 3
@@ -649,7 +686,7 @@ child:
   %oldslot = getelementptr ptr, ptr %data, i64 %j
   %newslot = getelementptr ptr, ptr %newdata, i64 %j
   %oldchild = load ptr, ptr %oldslot
-  %newchild = call ptr @j_gc_copy(ptr %oldchild, i64 48, ptr %isnew)
+  %newchild = call ptr @j_gc_obj(ptr %oldchild, ptr %isnew)
   store ptr %newchild, ptr %newslot
   %childfresh = load i1, ptr %isnew
   br i1 %childfresh, label %enqueue, label %childnext
@@ -857,10 +894,10 @@ done:
 }
 
 define ptr @j_str(ptr %bytes, i64 %length) {
-  %v = call ptr @j_alloc(i64 48)
+  %total = add i64 %length, 49
+  %v = call ptr @j_alloc(i64 %total)
   store i32 4, ptr %v
-  %n = add i64 %length, 1
-  %data = call ptr @j_alloc(i64 %n)
+  %data = getelementptr i8, ptr %v, i64 48
   call void @j_copy(ptr %data, ptr %bytes, i64 %length)
   %end = getelementptr i8, ptr %data, i64 %length
   store i8 0, ptr %end
