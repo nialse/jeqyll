@@ -989,6 +989,12 @@ entry:
   %sequence = call i1 @in_flag(ptr %reader, i32 512)
   %depthp = getelementptr %Input, ptr %reader, i32 0, i32 21
   %causep = getelementptr %Input, ptr %reader, i32 0, i32 23
+  %ndoff = alloca i64
+  %ndole = alloca ptr
+  %ndolm = alloca ptr
+  %ndolo = alloca i64
+  %ndolef = alloca i1
+  %ndolep = alloca ptr
   br label %loop
 loop:
   store i32 0, ptr %causep
@@ -1095,7 +1101,100 @@ record:
   br i1 %inside, label %problem, label %skip
 statecheck:
   %top = icmp eq i64 %depth, 0
+  %ndnoseq = xor i1 %sequence, true
+  %ndnostream = xor i1 %stream, true
+  %ndmode = and i1 %ndnoseq, %ndnostream
+  %ndtry = and i1 %top, %ndmode
+  br i1 %ndtry, label %ndline, label %nddecide
+nddecide:
   br i1 %top, label %value, label %state
+ndline:
+  %ndposp = getelementptr %Input, ptr %reader, i32 0, i32 6
+  %ndendp = getelementptr %Input, ptr %reader, i32 0, i32 7
+  %ndbufp = getelementptr %Input, ptr %reader, i32 0, i32 5
+  %ndposv = load i64, ptr %ndposp
+  %ndendv = load i64, ptr %ndendp
+  %ndbufv = load ptr, ptr %ndbufp
+  br label %ndscan
+ndscan:
+  %ndi = phi i64 [ %ndposv, %ndline ], [ %ndin, %ndstep ]
+  %ndhave = icmp ult i64 %ndi, %ndendv
+  br i1 %ndhave, label %ndbyte, label %nddecide
+ndbyte:
+  %ndq = getelementptr i8, ptr %ndbufv, i64 %ndi
+  %ndb = load i8, ptr %ndq
+  %ndisnl = icmp eq i8 %ndb, 10
+  br i1 %ndisnl, label %ndfound, label %ndstep
+ndstep:
+  %ndin = add i64 %ndi, 1
+  br label %ndscan
+ndfound:
+  %ndlinelen = sub i64 %ndi, %ndposv
+  %ndlne0 = load ptr, ptr @j_error
+  store ptr %ndlne0, ptr %ndole
+  %ndlm0 = load ptr, ptr @j_parse_error_message
+  store ptr %ndlm0, ptr %ndolm
+  %ndlo0 = load i64, ptr @j_parse_error_offset
+  store i64 %ndlo0, ptr %ndolo
+  %ndlef0 = load i1, ptr @j_parse_error_eof
+  store i1 %ndlef0, ptr %ndolef
+  %ndlep0 = load ptr, ptr @j_parse_error_path
+  store ptr %ndlep0, ptr %ndolep
+  %ndslice = getelementptr i8, ptr %ndbufv, i64 %ndposv
+  store i64 0, ptr %ndoff
+  %ndval = call ptr @j_parse(ptr %ndslice, i64 %ndlinelen, ptr %ndoff)
+  %ndok = icmp ne ptr %ndval, null
+  br i1 %ndok, label %ndcheckused, label %ndrestore
+ndcheckused:
+  %ndused = load i64, ptr %ndoff
+  %ndnonzero = icmp ugt i64 %ndused, 0
+  %ndwithin = icmp ule i64 %ndused, %ndlinelen
+  %ndusedok = and i1 %ndnonzero, %ndwithin
+  br i1 %ndusedok, label %ndtail, label %ndrestore
+ndtail:
+  %ndwhole = icmp eq i64 %ndused, %ndlinelen
+  br i1 %ndwhole, label %ndall, label %ndpart
+ndpart:
+  %ndnextidx = add i64 %ndposv, %ndused
+  %ndq2 = getelementptr i8, ptr %ndbufv, i64 %ndnextidx
+  %ndb2 = load i8, ptr %ndq2
+  %ndsp2 = icmp eq i8 %ndb2, 32
+  %ndtab2 = icmp eq i8 %ndb2, 9
+  %ndcr2 = icmp eq i8 %ndb2, 13
+  %ndwsa2 = or i1 %ndsp2, %ndtab2
+  %ndws2 = or i1 %ndwsa2, %ndcr2
+  br i1 %ndws2, label %ndthrough, label %ndrestore
+ndthrough:
+  store i64 %ndnextidx, ptr %ndposp
+  %ndcolp2 = getelementptr %Input, ptr %reader, i32 0, i32 9
+  %ndcolv2 = load i64, ptr %ndcolp2
+  %ndcoln2 = add i64 %ndcolv2, %ndused
+  store i64 %ndcoln2, ptr %ndcolp2
+  br label %nddone
+ndall:
+  %ndafternl = add i64 %ndi, 1
+  store i64 %ndafternl, ptr %ndposp
+  %ndlinep = getelementptr %Input, ptr %reader, i32 0, i32 8
+  %ndlinev = load i64, ptr %ndlinep
+  %ndlineno = add i64 %ndlinev, 1
+  store i64 %ndlineno, ptr %ndlinep
+  %ndcolp3 = getelementptr %Input, ptr %reader, i32 0, i32 9
+  store i64 0, ptr %ndcolp3
+  br label %nddone
+nddone:
+  br label %returned
+ndrestore:
+  %ndle1 = load ptr, ptr %ndole
+  store ptr %ndle1, ptr @j_error
+  %ndlm1 = load ptr, ptr %ndolm
+  store ptr %ndlm1, ptr @j_parse_error_message
+  %ndlo1 = load i64, ptr %ndolo
+  store i64 %ndlo1, ptr @j_parse_error_offset
+  %ndlef1 = load i1, ptr %ndolef
+  store i1 %ndlef1, ptr @j_parse_error_eof
+  %ndlep1 = load ptr, ptr %ndolep
+  store ptr %ndlep1, ptr @j_parse_error_path
+  br label %value
 state:
   %fi = sub i64 %depth, 1
   %frame = call ptr @in_frame(ptr %reader, i64 %fi)
@@ -1318,7 +1417,7 @@ commitvalue:
   %completedroot = icmp eq i64 %afterdepth, 0
   br i1 %completedroot, label %returned, label %loop
 returned:
-  %result = phi ptr [ %ending, %streamclose ], [ %pair, %streampair ], [ %accepted, %commitvalue ]
+  %result = phi ptr [ %ending, %streamclose ], [ %pair, %streampair ], [ %accepted, %commitvalue ], [ %ndval, %nddone ]
   %lineno = getelementptr %Input, ptr %reader, i32 0, i32 8
   %line = call i64 @in_position_line(ptr %reader)
   %lastp = getelementptr %Input, ptr %reader, i32 0, i32 10
