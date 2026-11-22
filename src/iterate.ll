@@ -25,6 +25,11 @@
 ; and collisions fall back to the original b_find switch path, so behavior
 ; cannot differ. The probe helper itself is @ev_name_id in eval.ll.
 @ev_g_blob = private constant [130 x i8] c"select\00range\00recurse\00recurse_down\00while\00until\00repeat\00first\00last\00nth\00limit\00skip\00isempty\00inputs\00any\00all\00fromstream\00truncate_stream\00\00"
+; Text builtins fast-pathed in @g_try_fast_depth. Ids here are local to this
+; table: 0/1 are the zero-arg ascii case converters, 2 is split, 3 is join and
+; 4-8 are the single-argument edge operations dispatched through @t_edge
+; (ltrimstr 4, rtrimstr 5, trimstr 6, startswith 7, endswith 8).
+@g_text_fast_names = private constant [86 x i8] c"ascii_downcase\00ascii_upcase\00split\00join\00ltrimstr\00rtrimstr\00trimstr\00startswith\00endswith\00\00"
 @ev_g_offs = private constant [18 x i32] [
   i32 0, i32 7, i32 13, i32 21, i32 34, i32 40, i32 46, i32 53, i32 59, i32 64, i32 68, i32 74, i32 79, i32 87, i32 94, i32 98,
   i32 102, i32 113
@@ -89,6 +94,10 @@ declare void @j_collect(ptr)
 declare ptr @j_expand_builtin(ptr, ptr, ptr, ptr)
 declare ptr @b_fast_zero_arg(ptr, ptr, ptr)
 declare ptr @ev_try_fast_assign(ptr, ptr, i32, ptr, ptr, i32)
+declare ptr @t_ascii(ptr, i1)
+declare ptr @t_edge(i32, ptr, ptr)
+declare ptr @j_split(ptr, ptr)
+declare ptr @t_join(ptr, ptr)
 
 define internal ptr @g_work(ptr %iterator, i32 %kind, i32 %op, ptr %node, ptr %input, ptr %env, ptr %continuation, ptr %handler, ptr %a, ptr %b, i64 %index) {
   %work = call ptr @j_alloc(i64 80)
@@ -492,7 +501,74 @@ bindbody:
 call:
   %carity = call i64 @b_len(ptr %b)
   %czero = icmp eq i64 %carity, 0
-  br i1 %czero, label %callzero, label %fail
+  %cone = icmp eq i64 %carity, 1
+  br i1 %czero, label %callzero, label %callonecheck
+callonecheck:
+  br i1 %cone, label %callone, label %fail
+callone:
+  %c1priv = icmp sle i32 %op, -2
+  br i1 %c1priv, label %callonearg, label %calloneshadow
+calloneshadow:
+  %c1fn = call ptr @ev_lookup(ptr %env, ptr %a, i32 1, i64 1)
+  %c1hasfn = icmp ne ptr %c1fn, null
+  %c1fl = call ptr @ev_lookup(ptr %env, ptr %a, i32 2, i64 0)
+  %c1hasfl = icmp ne ptr %c1fl, null
+  %c1shadowed = or i1 %c1hasfn, %c1hasfl
+  br i1 %c1shadowed, label %fail, label %callonearg
+callonearg:
+  %c1argast = call ptr @j_at(ptr %b, i64 0)
+  %c1argv = call ptr @g_try_fast_depth(ptr %c1argast, ptr %input, ptr %env, i32 %nextd)
+  %c1argok = icmp ne ptr %c1argv, null
+  br i1 %c1argok, label %callonedispatch, label %fail
+callonedispatch:
+  %c1tid = call i32 @b_find(ptr %a, ptr @g_text_fast_names)
+  switch i32 %c1tid, label %clearfail [
+    i32 2, label %c1split
+    i32 3, label %c1join
+    i32 4, label %c1edge
+    i32 5, label %c1edge
+    i32 6, label %c1edge
+    i32 7, label %c1edge
+    i32 8, label %c1edge
+  ]
+c1split:
+  %c1stag = load i32, ptr %input
+  %c1sinstr = icmp eq i32 %c1stag, 4
+  %c1satag = load i32, ptr %c1argv
+  %c1sargstr = icmp eq i32 %c1satag, 4
+  %c1spok = and i1 %c1sinstr, %c1sargstr
+  br i1 %c1spok, label %c1splitdo, label %clearfail
+c1splitdo:
+  %c1spres = call ptr @j_split(ptr %input, ptr %c1argv)
+  ret ptr %c1spres
+c1join:
+  %c1jtag = load i32, ptr %input
+  %c1jin = icmp eq i32 %c1jtag, 5
+  %c1jatag = load i32, ptr %c1argv
+  %c1jsep = icmp eq i32 %c1jatag, 4
+  %c1jok = and i1 %c1jin, %c1jsep
+  br i1 %c1jok, label %c1joindo, label %clearfail
+c1joindo:
+  %c1jres = call ptr @t_join(ptr %input, ptr %c1argv)
+  %c1jerr = load ptr, ptr @j_error
+  %c1jbad = icmp ne ptr %c1jerr, null
+  br i1 %c1jbad, label %clearfail, label %c1jret
+c1jret:
+  ret ptr %c1jres
+c1edge:
+  %c1etag = load i32, ptr %input
+  %c1ein = icmp eq i32 %c1etag, 4
+  %c1eatag = load i32, ptr %c1argv
+  %c1earg = icmp eq i32 %c1eatag, 4
+  %c1eok = and i1 %c1ein, %c1earg
+  br i1 %c1eok, label %c1edgedo, label %clearfail
+c1edgedo:
+  %c1elow = icmp ule i32 %c1tid, 6
+  %c1elowid = add i32 %c1tid, 4
+  %c1ehighid = sub i32 %c1tid, 1
+  %c1eid = select i1 %c1elow, i32 %c1elowid, i32 %c1ehighid
+  %c1eres = call ptr @t_edge(i32 %c1eid, ptr %input, ptr %c1argv)
+  ret ptr %c1eres
 callzero:
   %cpriv = icmp sle i32 %op, -2
   br i1 %cpriv, label %callbuiltin, label %calluser
@@ -526,9 +602,26 @@ callbuiltin:
   %cberr = load ptr, ptr @j_error
   %cbnoerr = icmp eq ptr %cberr, null
   %cbok = and i1 %csingle, %cbnoerr
-  br i1 %cbok, label %callbuiltinok, label %clearfail
+  br i1 %cbok, label %callbuiltinok, label %calltextcheck
 callbuiltinok:
   ret ptr %cbres
+calltextcheck:
+  %ctnoerr = icmp eq ptr %cberr, null
+  br i1 %ctnoerr, label %calltext, label %clearfail
+calltext:
+  %ctid = call i32 @b_find(ptr %a, ptr @g_text_fast_names)
+  %ctdown = icmp eq i32 %ctid, 0
+  %ctup = icmp eq i32 %ctid, 1
+  %ctascii = or i1 %ctdown, %ctup
+  br i1 %ctascii, label %calltextascii, label %clearfail
+calltextascii:
+  %cttag = load i32, ptr %input
+  %ctstr = icmp eq i32 %cttag, 4
+  br i1 %ctstr, label %calltextasciido, label %clearfail
+calltextasciido:
+  %ctupper = icmp eq i32 %ctid, 1
+  %ctres = call ptr @t_ascii(ptr %input, i1 %ctupper)
+  ret ptr %ctres
 obj:
   %ocount = call i64 @b_len(ptr %a)
   %oobj = call ptr @j_object()
